@@ -425,6 +425,26 @@ int main(int argc, char *argv[])
         settings.value(QStringLiteral("displayName")).toString()
         );
 
+    auto *speedrunApiKeyLabel = new QLabel(
+        QStringLiteral("Speedrun.com API key")
+        );
+
+    auto *speedrunApiKeyInput = new QLineEdit;
+    speedrunApiKeyInput->setEchoMode(QLineEdit::Password);
+    speedrunApiKeyInput->setPlaceholderText(
+        QStringLiteral("Paste from speedrun.com/api/auth")
+        );
+
+    auto *linkSpeedrunButton = new QPushButton(
+        QStringLiteral("Link Speedrun.com")
+        );
+
+    auto *speedrunStatus = new QLabel(
+        QStringLiteral("Speedrun.com: not linked")
+        );
+
+    speedrunStatus->setAlignment(Qt::AlignCenter);
+
     auto *levelLabel = new QLabel(QStringLiteral("Level"));
     auto *levelSelector = new QComboBox;
 
@@ -561,6 +581,10 @@ int main(int argc, char *argv[])
 
     layout->addWidget(displayNameLabel);
     layout->addWidget(displayNameInput);
+    layout->addWidget(speedrunApiKeyLabel);
+    layout->addWidget(speedrunApiKeyInput);
+    layout->addWidget(linkSpeedrunButton);
+    layout->addWidget(speedrunStatus);
     layout->addWidget(levelLabel);
     layout->addWidget(levelSelector);
     layout->addWidget(categoryLabel);
@@ -584,8 +608,111 @@ int main(int argc, char *argv[])
 
     auto *healthReply = networkManager->get(
         QNetworkRequest(
-            QUrl(QStringLiteral("http://127.0.0.1:3000/health"))
+            QUrl(QStringLiteral("https://api.trsr.app/health"))
             )
+        );
+
+    QObject::connect(
+        linkSpeedrunButton,
+        &QPushButton::clicked,
+        &window,
+        [networkManager, speedrunApiKeyInput, linkSpeedrunButton,
+         speedrunStatus, displayNameInput]() {
+            const QString apiKey = speedrunApiKeyInput->text().trimmed();
+
+            if (apiKey.isEmpty()) {
+                speedrunStatus->setText(
+                    QStringLiteral("Speedrun.com: enter an API key first")
+                    );
+                return;
+            }
+
+            linkSpeedrunButton->setEnabled(false);
+            speedrunStatus->setText(
+                QStringLiteral("Speedrun.com: linking...")
+                );
+
+            QJsonObject requestBody;
+            requestBody.insert(QStringLiteral("apiKey"), apiKey);
+
+            QNetworkRequest request{
+                QUrl(QStringLiteral("https://api.trsr.app/auth/speedrun"))
+            };
+            request.setHeader(
+                QNetworkRequest::ContentTypeHeader,
+                QStringLiteral("application/json")
+                );
+
+            auto *reply = networkManager->post(
+                request,
+                QJsonDocument(requestBody).toJson(QJsonDocument::Compact)
+                );
+
+            QObject::connect(
+                reply,
+                &QNetworkReply::finished,
+                [reply, speedrunApiKeyInput, linkSpeedrunButton,
+                 speedrunStatus, displayNameInput]() {
+                    const QJsonObject response =
+                        QJsonDocument::fromJson(reply->readAll()).object();
+
+                    if (reply->error() != QNetworkReply::NoError) {
+                        const QString serverError =
+                            response.value(QStringLiteral("error")).toString();
+
+                        speedrunStatus->setText(
+                            serverError.isEmpty()
+                                ? QStringLiteral("Speedrun.com: %1").arg(reply->errorString())
+                                : QStringLiteral("Speedrun.com: %1").arg(serverError)
+                            );
+
+                        linkSpeedrunButton->setEnabled(true);
+                        reply->deleteLater();
+                        return;
+                    }
+
+                    if (response.value(QStringLiteral("status")).toString()
+                        != QStringLiteral("linked")) {
+                        speedrunStatus->setText(
+                            QStringLiteral("Speedrun.com: invalid API key")
+                            );
+                        linkSpeedrunButton->setEnabled(true);
+                        reply->deleteLater();
+                        return;
+                    }
+
+                    const QJsonObject profile =
+                        response.value(QStringLiteral("profile")).toObject();
+
+                    const QString displayName =
+                        profile.value(QStringLiteral("displayName")).toString();
+
+                    QSettings settings;
+                    settings.setValue(
+                        QStringLiteral("matchmaking/sessionToken"),
+                        response.value(QStringLiteral("sessionToken")).toString()
+                        );
+                    settings.setValue(
+                        QStringLiteral("matchmaking/speedrunUserId"),
+                        profile.value(QStringLiteral("id")).toString()
+                        );
+                    settings.setValue(
+                        QStringLiteral("displayName"),
+                        displayName
+                        );
+
+                    displayNameInput->setText(displayName);
+                    speedrunApiKeyInput->clear();
+
+                    speedrunStatus->setText(
+                        QStringLiteral("Speedrun.com: linked as %1")
+                            .arg(displayName)
+                        );
+
+                    reply->deleteLater();
+                }
+                );
+        }
         );
 
     QObject::connect(
@@ -616,7 +743,7 @@ int main(int argc, char *argv[])
             auto *reply = networkManager->get(
                 QNetworkRequest(
                     QUrl(
-                        QStringLiteral("http://127.0.0.1:3000/matches/")
+                        QStringLiteral("https://api.trsr.app/matches/")
                         + playerId
                         )
                     )
@@ -683,15 +810,17 @@ int main(int argc, char *argv[])
         randomQueueButton,
         &QPushButton::clicked,
         &window,
-        [networkManager, displayNameInput, randomQueueButton, queueStatus,
+        [networkManager, randomQueueButton, queueStatus,
          levelSelector, categorySelector, subcategorySelector, matchPollTimer,
          playerId]() {
-            const QString displayName =
-                displayNameInput->text().trimmed();
+            QSettings settings;
 
-            if (displayName.isEmpty()) {
+            const QString sessionToken =
+                settings.value(QStringLiteral("matchmaking/sessionToken")).toString();
+
+            if (sessionToken.isEmpty()) {
                 queueStatus->setText(
-                    QStringLiteral("Matchmaking: enter a display name first")
+                    QStringLiteral("Matchmaking: link Speedrun.com first")
                     );
                 return;
             }
@@ -704,12 +833,12 @@ int main(int argc, char *argv[])
 
             const QJsonObject requestBody{
                 {QStringLiteral("playerId"), playerId},
-                {QStringLiteral("displayName"), displayName},
+                {QStringLiteral("sessionToken"), sessionToken},
                 {QStringLiteral("queueType"), QStringLiteral("random")}
             };
 
             QNetworkRequest request(
-                QUrl(QStringLiteral("http://127.0.0.1:3000/queue"))
+                QUrl(QStringLiteral("https://api.trsr.app/queue"))
                 );
 
             request.setHeader(
@@ -803,12 +932,14 @@ int main(int argc, char *argv[])
          rulesetQueueButton, queueStatus, levelSelector,
          categorySelector, subcategorySelector, matchPollTimer,
          playerId]() {
-            const QString displayName =
-                displayNameInput->text().trimmed();
+            QSettings settings;
 
-            if (displayName.isEmpty()) {
+            const QString sessionToken =
+                settings.value(QStringLiteral("matchmaking/sessionToken")).toString();
+
+            if (sessionToken.isEmpty()) {
                 queueStatus->setText(
-                    QStringLiteral("Matchmaking: enter a display name first")
+                    QStringLiteral("Matchmaking: link Speedrun.com first")
                     );
                 return;
             }
@@ -822,7 +953,7 @@ int main(int argc, char *argv[])
 
             const QJsonObject requestBody{
                 {QStringLiteral("playerId"), playerId},
-                {QStringLiteral("displayName"), displayName},
+                {QStringLiteral("sessionToken"), sessionToken},
                 {QStringLiteral("queueType"), QStringLiteral("ruleset")},
                 {QStringLiteral("category"), categorySelector->currentText()},
                 {QStringLiteral(
@@ -831,7 +962,7 @@ int main(int argc, char *argv[])
             };
 
             QNetworkRequest request(
-                QUrl(QStringLiteral("http://127.0.0.1:3000/queue"))
+                QUrl(QStringLiteral("https://api.trsr.app/queue"))
                 );
 
             request.setHeader(
