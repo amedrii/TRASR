@@ -2,7 +2,7 @@ const crypto = require("crypto");
 const express = require("express");
 
 const app = express();
-const port = 3000;
+const port = Number(process.env.PORT) || 3000;
 
 app.use(express.json());
 
@@ -119,14 +119,24 @@ app.post("/auth/speedrun", async (request, response) => {
 });
 
 app.post("/queue", (request, response) => {
-    const { playerId, displayName, queueType, category, subcategory } =
+    const { playerId, sessionToken, queueType, category, subcategory } =
         request.body;
 
-    if (!playerId || !displayName) {
-        return response.status(400).json({
-            error: "playerId and displayName are required."
+    const session = sessions.get(sessionToken);
+
+    if (!session) {
+        return response.status(401).json({
+            error: "Link your Speedrun.com account before matchmaking."
         });
     }
+
+    if (!playerId) {
+        return response.status(400).json({
+            error: "A player ID is required."
+        });
+    }
+
+    const displayName = session.displayName;
 
     if (queueType !== "random" && queueType !== "ruleset") {
         return response.status(400).json({
@@ -216,6 +226,6 @@ app.get("/matches/:playerId", (request, response) => {
     });
 });
 
-app.listen(port, () => {
-    console.log(`TRASR server is running at http://localhost:${port}`);
+app.listen(port, "0.0.0.0", () => {
+    console.log(`TRASR server is running on port ${port}`);
 });
