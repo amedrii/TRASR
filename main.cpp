@@ -451,6 +451,10 @@ int main(int argc, char *argv[])
         );
     accountStatus->setAlignment(Qt::AlignCenter);
 
+    auto *logoutButton = new QPushButton(
+        QStringLiteral("Log out")
+        );
+
     auto *content = new QWidget;
     auto *layout = new QVBoxLayout(content);
 
@@ -589,6 +593,7 @@ int main(int argc, char *argv[])
     refreshSelection();
 
     layout->addWidget(accountStatus);
+    layout->addWidget(logoutButton);
     layout->addWidget(levelLabel);
     layout->addWidget(levelSelector);
     layout->addWidget(categoryLabel);
@@ -614,6 +619,19 @@ int main(int argc, char *argv[])
         QNetworkRequest(
             QUrl(QStringLiteral("https://api.trsr.app/health"))
             )
+        );
+
+    QObject::connect(
+        logoutButton,
+        &QPushButton::clicked,
+        &window,
+        [&window]() {
+            QSettings settings;
+            settings.remove(QStringLiteral("matchmaking/sessionToken"));
+            settings.remove(QStringLiteral("matchmaking/speedrunUserId"));
+            settings.sync();
+            window.close();
+        }
         );
 
     const QString savedSessionToken =
