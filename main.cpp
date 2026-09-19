@@ -1378,16 +1378,15 @@ int main(int argc, char *argv[])
                     "Selected speedrun:\n%1\n%2\n%3"
                     "\n\n%4\n\nIGT\n%5\n\nPB IGT\n%6\n\n%7"
                     )
-                    .arg(levelSelector->currentText())
-                    .arg(rulesetName(
-                        categorySelector->currentText(),
-                        subcategorySelector->currentText()
-                        ))
-                    .arg(levelVerificationStatus)
-                    .arg(activityStatus)
-                    .arg(gameTimeStatus)
-                    .arg(bestIgtStatus)
-                    .arg(integrityStatus)
+                    .arg(
+                        levelSelector->currentText(),
+                        rulesetName(categorySelector->currentText(), subcategorySelector->currentText()),
+                        levelVerificationStatus,
+                        activityStatus,
+                        gameTimeStatus,
+                        bestIgtStatus,
+                        integrityStatus
+                        )
                 );
         };
 
