@@ -34,6 +34,11 @@ static const QString kSupportedSteamBuildSha256 =
         "7461663a67bc3b9e7324afbd1e0ac8d4e092bd7083ddf147231a42a790814b0e"
         );
 
+static const QString kSupportedOriginalPcBuildSha256 =
+    QStringLiteral(
+        "5ca17c3a1e40d12a54392b984aa2df0d2ecfbc65c8eab0f06e361a195525e2ed"
+        );
+
 // Reverse-engineered memory addresses for the supported TRA build.
 static constexpr DWORD_PTR kLaraHealthAddress = 0x00665460;
 static constexpr DWORD_PTR kGameTimeAddress = 0x00665B10;
@@ -249,7 +254,8 @@ static std::optional<TraProcess> findTraProcess()
                 buildHash = sha256ForFile(executablePath);
 
                 // Health and IGT addresses are only known for the supported build.
-                if (buildHash == kSupportedSteamBuildSha256) {
+                if (buildHash == kSupportedSteamBuildSha256
+                    || buildHash == kSupportedOriginalPcBuildSha256) {
                     SIZE_T bytesRead = 0;
 
                     healthAvailable = ReadProcessMemory(
@@ -319,11 +325,50 @@ static std::optional<TraProcess> findTraProcess()
 static QString expectedLevelCode(int levelIndex)
 {
     switch (levelIndex) {
+    case 0:
+        return QStringLiteral("pu1"); // Mountain Caves
+
+    case 1:
+        return QStringLiteral("pu8"); // City of Vilcabamba
+
+    case 2:
+        return QStringLiteral("pu11"); // The Lost Valley
+
+    case 3:
+        return QStringLiteral("pu16"); // Tomb of Qualopec
+
+    case 4:
+        return QStringLiteral("gr1"); // St. Francis Folly
+
+    case 5:
+        return QStringLiteral("gr31"); // The Coliseum
+
+    case 6:
+        return QStringLiteral("gr18"); // Midas Palace
+
+    case 7:
+        return QStringLiteral("gr27"); // Tomb of Tihocan
+
+    case 8:
+        return QStringLiteral("eg1"); // Temple of Khamoon
+
+    case 9:
+        return QStringLiteral("eg11"); // Obelisk of Khamoon
+
+    case 10:
+        return QStringLiteral("eg20"); // Sanctuary of the Scion
+
+    case 11:
+        return QStringLiteral("lc1"); // Natla's Mines
+
     case 12:
         return QStringLiteral("lc11"); // The Great Pyramid
 
     case 13:
         return QStringLiteral("lc17"); // Final Conflict
+
+    case 14:
+        return QStringLiteral("ma1"); // Croft Manor
 
     default:
         return {};
