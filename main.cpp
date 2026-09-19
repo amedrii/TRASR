@@ -4,6 +4,8 @@
 #include <QCryptographicHash>
 #include <QFile>
 #include <QFont>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMainWindow>
@@ -15,12 +17,10 @@
 #include <QSettings>
 #include <QStringList>
 #include <QTimer>
+#include <QUuid>
 #include <QUrl>
 #include <QVBoxLayout>
 #include <QWidget>
-#include <QJsonDocument>
-#include <QJsonObject>
-#include <QUuid>
 
 #include <optional>
 
@@ -28,41 +28,53 @@
 #include <windows.h>
 #include <tlhelp32.h>
 
+// These addresses are only trusted for this exact Steam executable.
 static const QString kSupportedSteamBuildSha256 =
-    QStringLiteral("7461663a67bc3b9e7324afbd1e0ac8d4e092bd7083ddf147231a42a790814b0e");
+    QStringLiteral(
+        "7461663a67bc3b9e7324afbd1e0ac8d4e092bd7083ddf147231a42a790814b0e"
+        );
 
+// Reverse-engineered memory addresses for the supported TRA build.
 static constexpr DWORD_PTR kLaraHealthAddress = 0x00665460;
 static constexpr DWORD_PTR kGameTimeAddress = 0x00665B10;
 static constexpr DWORD_PTR kLoadedLevelAddress = 0x008AE384;
 static constexpr DWORD_PTR kCurrentPositionAddress = 0x008AF450;
 
+// A read-only snapshot of the running TRA process.
 struct TraProcess
 {
     DWORD processId;
     QString executablePath;
     QString buildHash;
     QString blockedModule;
+
     float laraHealth;
     bool healthAvailable;
+
     float gameTime;
     bool gameTimeAvailable;
+
     QString loadedLevelCode;
     bool loadedLevelAvailable;
+
     QString currentPositionCode;
     bool currentPositionAvailable;
 };
 
 static QString rulesetName(
     const QString &category,
-    const QString &subcategory)
+    const QString &subcategory
+    )
 {
     return category + QStringLiteral(" — ") + subcategory;
 }
 
+// QSettings keys for a PB and the most recently confirmed attempt.
 static QString bestIgtKey(
     const QString &level,
     const QString &category,
-    const QString &subcategory)
+    const QString &subcategory
+    )
 {
     return QStringLiteral("results/")
     + level + QStringLiteral("/")
@@ -73,7 +85,8 @@ static QString bestIgtKey(
 static QString lastIgtKey(
     const QString &level,
     const QString &category,
-    const QString &subcategory)
+    const QString &subcategory
+    )
 {
     return QStringLiteral("results/")
     + level + QStringLiteral("/")
@@ -81,6 +94,7 @@ static QString lastIgtKey(
         + subcategory + QStringLiteral("/lastIgt");
 }
 
+// The game executable rarely changes while TRASR is open, so cache its hash.
 static QString sha256ForFile(const QString &filePath)
 {
     static QString cachedPath;
@@ -108,6 +122,8 @@ static QString sha256ForFile(const QString &filePath)
     return cachedHash;
 }
 
+// Ranked integrity check.
+// This only lists modules loaded in TRA; TRASR never injects into or writes to it.
 static QString blockedModuleName(DWORD processId)
 {
     HANDLE snapshot = CreateToolhelp32Snapshot(
@@ -143,6 +159,8 @@ static QString blockedModuleName(DWORD processId)
     return blockedModule;
 }
 
+// Reads TRA's fixed 32-byte ASCII level-state fields, such as "lc11".
+// The extra byte in text ensures QString always receives a null-terminated string.
 static bool readFixedGameString(
     HANDLE processHandle,
     DWORD_PTR address,
@@ -168,6 +186,7 @@ static bool readFixedGameString(
     return true;
 }
 
+// Finds tra.exe and creates one current read-only snapshot for the UI.
 static std::optional<TraProcess> findTraProcess()
 {
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -186,19 +205,25 @@ static std::optional<TraProcess> findTraProcess()
             const QString processName =
                 QString::fromWCharArray(process.szExeFile);
 
-            if (processName.compare(QStringLiteral("tra.exe"),
-                                    Qt::CaseInsensitive) != 0) {
+            if (processName.compare(
+                    QStringLiteral("tra.exe"),
+                    Qt::CaseInsensitive
+                    ) != 0) {
                 continue;
             }
 
             QString executablePath = QStringLiteral("Path unavailable");
             QString buildHash = QStringLiteral("Hash unavailable");
+
             float laraHealth = 0.0f;
             bool healthAvailable = false;
+
             float gameTime = 0.0f;
             bool gameTimeAvailable = false;
+
             QString loadedLevelCode;
             bool loadedLevelAvailable = false;
+
             QString currentPositionCode;
             bool currentPositionAvailable = false;
 
@@ -213,13 +238,17 @@ static std::optional<TraProcess> findTraProcess()
                 DWORD pathLength = MAX_PATH;
 
                 if (QueryFullProcessImageNameW(
-                        processHandle, 0, path, &pathLength)) {
+                        processHandle,
+                        0,
+                        path,
+                        &pathLength)) {
                     executablePath =
                         QString::fromWCharArray(path, pathLength);
                 }
 
                 buildHash = sha256ForFile(executablePath);
 
+                // Health and IGT addresses are only known for the supported build.
                 if (buildHash == kSupportedSteamBuildSha256) {
                     SIZE_T bytesRead = 0;
 
@@ -242,6 +271,8 @@ static std::optional<TraProcess> findTraProcess()
                                             ) && bytesRead == sizeof(gameTime);
                 }
 
+                // These strings let TRASR distinguish selected/preloaded levels
+                // from the level Lara is actually inside.
                 loadedLevelAvailable = readFixedGameString(
                     processHandle,
                     kLoadedLevelAddress,
@@ -268,8 +299,7 @@ static std::optional<TraProcess> findTraProcess()
                 laraHealth,
                 healthAvailable,
                 gameTime,
-                gameTimeAvailable
-                ,
+                gameTimeAvailable,
                 loadedLevelCode,
                 loadedLevelAvailable,
                 currentPositionCode,
@@ -284,6 +314,8 @@ static std::optional<TraProcess> findTraProcess()
     return result;
 }
 
+// The level dropdown has a fixed order. Add verified TRA level-code mappings here.
+// Unknown levels intentionally return empty until they have been tested.
 static QString expectedLevelCode(int levelIndex)
 {
     switch (levelIndex) {
@@ -314,6 +346,7 @@ int main(int argc, char *argv[])
     QCoreApplication::setOrganizationName(QStringLiteral("TRASR"));
     QCoreApplication::setApplicationName(QStringLiteral("TRASR"));
 
+    // QSettings stores selections and PBs between application launches.
     QSettings settings;
 
     QMainWindow window;
@@ -374,6 +407,7 @@ int main(int argc, char *argv[])
         QStringLiteral("Glitchless")
     });
 
+    // Restore the user's previous local selection.
     const int savedLevelIndex = levelSelector->findText(
         settings.value(
                     QStringLiteral("selectedLevel"),
@@ -416,6 +450,7 @@ int main(int argc, char *argv[])
         );
     serverStatus->setAlignment(Qt::AlignCenter);
 
+    // UI only for now; queue joining is the next matchmaking step.
     auto *randomQueueButton = new QPushButton(
         QStringLiteral("Join random queue")
         );
@@ -423,7 +458,6 @@ int main(int argc, char *argv[])
     auto *queueStatus = new QLabel(
         QStringLiteral("Matchmaking: not queued")
         );
-
     queueStatus->setAlignment(Qt::AlignCenter);
 
     QFont statusFont;
@@ -436,6 +470,7 @@ int main(int argc, char *argv[])
         );
     confirmButton->setEnabled(false);
 
+    // Save a changed ruleset and load its matching local PB.
     auto refreshSelection =
         [levelSelector, categorySelector, subcategorySelector,
          confirmButton]() {
@@ -479,6 +514,7 @@ int main(int argc, char *argv[])
 
     window.setCentralWidget(content);
 
+    // Local development health check for the Node matchmaking server.
     auto *networkManager = new QNetworkAccessManager(&window);
 
     auto *healthReply = networkManager->get(
@@ -533,6 +569,8 @@ int main(int argc, char *argv[])
         }
         );
 
+    // Poll ten times per second. IGT updates in whole seconds, but faster polling
+    // helps distinguish normal play from pauses and loading transitions.
     auto updateStatus =
         [status, levelSelector, categorySelector, subcategorySelector,
          confirmButton, previousGameTime = -1.0f,
@@ -548,9 +586,10 @@ int main(int argc, char *argv[])
                 return;
             }
 
-            const QString gameTimeStatus = process->gameTimeAvailable
-                ? formatIgt(process->gameTime)
-                : QStringLiteral("--:--");
+            const QString gameTimeStatus =
+                process->gameTimeAvailable
+                    ? formatIgt(process->gameTime)
+                    : QStringLiteral("--:--");
 
             const QString loadedLevelStatus =
                 process->loadedLevelAvailable
@@ -565,6 +604,8 @@ int main(int argc, char *argv[])
             const QString selectedLevelCode =
                 expectedLevelCode(levelSelector->currentIndex());
 
+            // TRA may preload the next level before Lara has left the old level.
+            // We require both codes to agree before calling a mapped level active.
             const bool expectedLevelIsActive =
                 !selectedLevelCode.isEmpty()
                 && process->loadedLevelAvailable
@@ -582,9 +623,10 @@ int main(int argc, char *argv[])
             const float bestIgt =
                 confirmButton->property("bestIgt").toFloat();
 
-            const QString bestIgtStatus = bestIgt >= 0.0f
-                                              ? formatIgt(bestIgt)
-                                              : QStringLiteral("--:--");
+            const QString bestIgtStatus =
+                bestIgt >= 0.0f
+                    ? formatIgt(bestIgt)
+                    : QStringLiteral("--:--");
 
             QString runStatus;
 
@@ -600,6 +642,8 @@ int main(int argc, char *argv[])
                 runStatus = QStringLiteral("Running");
                 unchangedPolls = 0;
             } else {
+                // Twenty 100 ms polls gives a two-second grace period. This stops
+                // a normal IGT update gap from being mistaken for a pause/finish.
                 ++unchangedPolls;
 
                 runStatus = unchangedPolls <= 20
@@ -610,6 +654,9 @@ int main(int argc, char *argv[])
 
             previousGameTime = process->gameTime;
 
+            // A frozen IGT can mean pause, loading, or finish. Manual confirmation
+            // remains necessary until each level's real completion transition is
+            // mapped and verified.
             const bool finishCandidate =
                 process->gameTimeAvailable
                 && process->gameTime > 0.0f
@@ -622,6 +669,7 @@ int main(int argc, char *argv[])
                 confirmedValue.isValid()
                 && confirmedValue.toFloat() == process->gameTime;
 
+            // TRAE-Menu-Hook.asi blocks attempt confirmation.
             const bool integrityPassed = process->blockedModule.isEmpty();
 
             confirmButton->setEnabled(
@@ -671,6 +719,8 @@ int main(int argc, char *argv[])
     QTimer timer;
     QObject::connect(&timer, &QTimer::timeout, &window, updateStatus);
 
+    // A confirmed finish writes a durable JSON attempt before it updates the
+    // convenient local PB cache.
     QObject::connect(
         confirmButton,
         &QPushButton::clicked,
@@ -706,6 +756,7 @@ int main(int argc, char *argv[])
                 return;
             }
 
+            // Prevent duplicate confirmation for the same frozen IGT value.
             confirmButton->setProperty(
                 "confirmedCandidateIgt",
                 candidateIgt
@@ -732,9 +783,10 @@ int main(int argc, char *argv[])
                 confirmButton->setProperty("bestIgt", candidateIgt);
             }
 
-            const QString message = isPersonalBest
-                                        ? QStringLiteral("New PB: ")
-                                        : QStringLiteral("Confirmed IGT: ");
+            const QString message =
+                isPersonalBest
+                    ? QStringLiteral("New PB: ")
+                    : QStringLiteral("Confirmed IGT: ");
 
             QMessageBox::information(
                 nullptr,
