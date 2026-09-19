@@ -549,6 +549,10 @@ int main(int argc, char *argv[])
         QStringLiteral("Join selected ruleset queue")
         );
 
+    auto *cancelQueueButton = new QPushButton(
+        QStringLiteral("Cancel queue")
+        );
+
     auto *queueStatus = new QLabel(
         QStringLiteral("Matchmaking: not queued")
         );
@@ -603,6 +607,7 @@ int main(int argc, char *argv[])
     layout->addWidget(serverStatus);
     layout->addWidget(randomQueueButton);
     layout->addWidget(rulesetQueueButton);
+    layout->addWidget(cancelQueueButton);
     layout->addWidget(queueStatus);
     layout->addWidget(status);
     layout->addWidget(confirmButton);
@@ -891,6 +896,64 @@ int main(int argc, char *argv[])
                     matchPollTimer->stop();
                     randomQueueButton->setEnabled(false);
                     rulesetQueueButton->setEnabled(false);
+                    reply->deleteLater();
+                }
+                );
+        }
+        );
+
+    QObject::connect(
+        cancelQueueButton,
+        &QPushButton::clicked,
+        &window,
+        [networkManager, randomQueueButton, rulesetQueueButton,
+         queueStatus, playerId]() {
+            QSettings settings;
+            const QString sessionToken =
+                settings.value(QStringLiteral("matchmaking/sessionToken")).toString();
+
+            if (sessionToken.isEmpty()) {
+                queueStatus->setText(
+                    QStringLiteral("Matchmaking: link Speedrun.com first")
+                    );
+                return;
+            }
+
+            QJsonObject requestBody{
+                {QStringLiteral("playerId"), playerId},
+                {QStringLiteral("sessionToken"), sessionToken}
+            };
+
+            QNetworkRequest request(
+                QUrl(QStringLiteral("https://api.trsr.app/queue/cancel"))
+                );
+            request.setHeader(
+                QNetworkRequest::ContentTypeHeader,
+                QStringLiteral("application/json")
+                );
+
+            auto *reply = networkManager->post(
+                request,
+                QJsonDocument(requestBody).toJson(QJsonDocument::Compact)
+                );
+
+            QObject::connect(
+                reply,
+                &QNetworkReply::finished,
+                [reply, randomQueueButton, rulesetQueueButton, queueStatus]() {
+                    if (reply->error() != QNetworkReply::NoError) {
+                        queueStatus->setText(
+                            QStringLiteral("Matchmaking: could not cancel queue")
+                            );
+                        reply->deleteLater();
+                        return;
+                    }
+
+                    queueStatus->setText(
+                        QStringLiteral("Matchmaking: queue cancelled")
+                        );
+                    randomQueueButton->setEnabled(true);
+                    rulesetQueueButton->setEnabled(true);
                     reply->deleteLater();
                 }
                 );
@@ -1299,40 +1362,33 @@ int main(int argc, char *argv[])
                     : QStringLiteral("Integrity failure: ")
                           + process->blockedModule;
 
-            if(loadedLevelStatus.length() == 5 ){
-                status->setText(
-                    QStringLiteral(
-                        "Selected speedrun:\n%1\n%2\n\nIN MAIN MENU"
-                        "\n\nPB IGT\n%3\n%4"
-                        )
-                        .arg(levelSelector->currentText())
-                        .arg(rulesetName(
-                            categorySelector->currentText(),
-                            subcategorySelector->currentText()
-                            ))
-                        .arg(bestIgtStatus)
-                        .arg(integrityStatus)
-                    );
-            }else{
-                status->setText(
-                    QStringLiteral(
-                        "Selected speedrun:\n%1\n%2\n%3\n\nLoaded: %4\nPosition: %5"
-                        "\n\n\nIGT\n%6\n\nPB IGT\n%7\n\n%8\n\n%9"
-                        )
-                        .arg(levelSelector->currentText())
-                        .arg(rulesetName(
-                            categorySelector->currentText(),
-                            subcategorySelector->currentText()
-                            ))
-                        .arg(levelVerificationStatus)
-                        .arg(loadedLevelStatus)
-                        .arg(currentPositionStatus)
-                        .arg(gameTimeStatus)
-                        .arg(bestIgtStatus)
-                        .arg(runStatus)
-                        .arg(integrityStatus)
-                    );
-            }
+            const bool isInMainMenu =
+                loadedLevelStatus.compare(QStringLiteral("Pu104"), Qt::CaseInsensitive) == 0
+                || loadedLevelStatus.compare(QStringLiteral("Gr104"), Qt::CaseInsensitive) == 0
+                || loadedLevelStatus.compare(QStringLiteral("Eg104"), Qt::CaseInsensitive) == 0
+                || loadedLevelStatus.compare(QStringLiteral("Lc104"), Qt::CaseInsensitive) == 0;
+
+            // Keep one fixed layout. The central line changes with the game state,
+            // so the window does not resize when leaving the main menu.
+            const QString activityStatus =
+                isInMainMenu ? QStringLiteral("Main Menu") : runStatus;
+
+            status->setText(
+                QStringLiteral(
+                    "Selected speedrun:\n%1\n%2\n%3"
+                    "\n\n%4\n\nIGT\n%5\n\nPB IGT\n%6\n\n%7"
+                    )
+                    .arg(levelSelector->currentText())
+                    .arg(rulesetName(
+                        categorySelector->currentText(),
+                        subcategorySelector->currentText()
+                        ))
+                    .arg(levelVerificationStatus)
+                    .arg(activityStatus)
+                    .arg(gameTimeStatus)
+                    .arg(bestIgtStatus)
+                    .arg(integrityStatus)
+                );
         };
 
     QTimer timer;

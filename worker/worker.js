@@ -54,6 +54,17 @@ export default {
       return session ? json({ status: "valid", profile: { id: session.speedrun_user_id, displayName: session.display_name } }) : json({ error: "Your TRSR login has expired." }, 401);
     }
 
+    if (request.method === "POST" && url.pathname === "/queue/cancel") {
+      const data = await body(request);
+      const playerId = typeof data?.playerId === "string" ? data.playerId.trim() : "";
+      const session = await sessionFor(env, data?.sessionToken);
+      if (!playerId) return json({ error: "A player ID is required." }, 400);
+      if (!session) return json({ error: "Link your Speedrun.com account before matchmaking." }, 401);
+      await env.DB.prepare(`DELETE FROM queue_entries WHERE player_id = ? AND speedrun_user_id = ?`)
+        .bind(playerId, session.speedrun_user_id).run();
+      return json({ status: "cancelled" });
+    }
+
     if (request.method === "POST" && url.pathname === "/queue") {
       const data = await body(request);
       const playerId = typeof data?.playerId === "string" ? data.playerId.trim() : "";
