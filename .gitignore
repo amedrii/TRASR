@@ -19,3 +19,5 @@ compile_commands.json
 *.a
 *.lib
 .qtcreator/
+server/node_modules/
+server/.env
