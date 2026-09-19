@@ -1,0 +1,21 @@
+# Qt Creator user-specific files
+*.pro.user
+*.pro.user.*
+*.qtc.user
+*.autosave
+
+# CMake and Qt build output
+build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+
+# Compiled Windows artifacts
+*.exe
+*.dll
+*.obj
+*.pdb
+*.a
+*.lib
+.qtcreator/
