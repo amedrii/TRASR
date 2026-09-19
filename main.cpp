@@ -999,7 +999,7 @@ int main(int argc, char *argv[])
                     ? QStringLiteral("Level verification: mapping needed")
                     : expectedLevelIsActive
                           ? QStringLiteral("Level verification: passed")
-                          : QStringLiteral("Level verification: waiting");
+                          : QStringLiteral("Level verification: failed");
 
             const float bestIgt =
                 confirmButton->property("bestIgt").toFloat();
@@ -1077,24 +1077,40 @@ int main(int argc, char *argv[])
                     : QStringLiteral("Integrity failure: ")
                           + process->blockedModule;
 
-            status->setText(
-                QStringLiteral(
-                    "%1\n%2\n%3\n\nLoaded: %4\nPosition: %5"
-                    "\n\nIGT\n%6\n\nPB IGT\n%7\n\n%8\n\n%9"
-                    )
-                    .arg(levelSelector->currentText())
-                    .arg(rulesetName(
-                        categorySelector->currentText(),
-                        subcategorySelector->currentText()
-                        ))
-                    .arg(levelVerificationStatus)
-                    .arg(loadedLevelStatus)
-                    .arg(currentPositionStatus)
-                    .arg(gameTimeStatus)
-                    .arg(bestIgtStatus)
-                    .arg(runStatus)
-                    .arg(integrityStatus)
-                );
+            if(loadedLevelStatus.length() == 5 ){
+                status->setText(
+                    QStringLiteral(
+                        "Selected speedrun:\n%1\n%2\n\nIN MAIN MENU"
+                        "\n\nPB IGT\n%3\n%4"
+                        )
+                        .arg(levelSelector->currentText())
+                        .arg(rulesetName(
+                            categorySelector->currentText(),
+                            subcategorySelector->currentText()
+                            ))
+                        .arg(bestIgtStatus)
+                        .arg(integrityStatus)
+                    );
+            }else{
+                status->setText(
+                    QStringLiteral(
+                        "Selected speedrun:\n%1\n%2\n%3\n\nLoaded: %4\nPosition: %5"
+                        "\n\n\nIGT\n%6\n\nPB IGT\n%7\n\n%8\n\n%9"
+                        )
+                        .arg(levelSelector->currentText())
+                        .arg(rulesetName(
+                            categorySelector->currentText(),
+                            subcategorySelector->currentText()
+                            ))
+                        .arg(levelVerificationStatus)
+                        .arg(loadedLevelStatus)
+                        .arg(currentPositionStatus)
+                        .arg(gameTimeStatus)
+                        .arg(bestIgtStatus)
+                        .arg(runStatus)
+                        .arg(integrityStatus)
+                    );
+            }
         };
 
     QTimer timer;
