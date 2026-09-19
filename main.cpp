@@ -349,6 +349,18 @@ int main(int argc, char *argv[])
     // QSettings stores selections and PBs between application launches.
     QSettings settings;
 
+    QString playerId =
+        settings.value(QStringLiteral("matchmaking/playerId")).toString();
+
+    if (playerId.isEmpty()) {
+        playerId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+
+        settings.setValue(
+            QStringLiteral("matchmaking/playerId"),
+            playerId
+            );
+    }
+
     QMainWindow window;
     window.setWindowTitle(QStringLiteral("TRASR"));
 
@@ -455,6 +467,10 @@ int main(int argc, char *argv[])
         QStringLiteral("Join random queue")
         );
 
+    auto *rulesetQueueButton = new QPushButton(
+        QStringLiteral("Join selected ruleset queue")
+        );
+
     auto *queueStatus = new QLabel(
         QStringLiteral("Matchmaking: not queued")
         );
@@ -508,6 +524,7 @@ int main(int argc, char *argv[])
     layout->addWidget(subcategorySelector);
     layout->addWidget(serverStatus);
     layout->addWidget(randomQueueButton);
+    layout->addWidget(rulesetQueueButton);
     layout->addWidget(queueStatus);
     layout->addWidget(status);
     layout->addWidget(confirmButton);
@@ -516,6 +533,9 @@ int main(int argc, char *argv[])
 
     // Local development health check for the Node matchmaking server.
     auto *networkManager = new QNetworkAccessManager(&window);
+
+    auto *matchPollTimer = new QTimer(&window);
+    matchPollTimer->setInterval(1000);
 
     auto *healthReply = networkManager->get(
         QNetworkRequest(
@@ -539,6 +559,322 @@ int main(int argc, char *argv[])
             }
 
             healthReply->deleteLater();
+        }
+        );
+
+    QObject::connect(
+        matchPollTimer,
+        &QTimer::timeout,
+        &window,
+        [networkManager, matchPollTimer, randomQueueButton, rulesetQueueButton, queueStatus,
+         levelSelector, categorySelector, subcategorySelector, playerId]() {
+            auto *reply = networkManager->get(
+                QNetworkRequest(
+                    QUrl(
+                        QStringLiteral("http://127.0.0.1:3000/matches/")
+                        + playerId
+                        )
+                    )
+                );
+
+            QObject::connect(
+                reply,
+                &QNetworkReply::finished,
+                [reply, matchPollTimer, randomQueueButton, rulesetQueueButton,
+                 queueStatus, levelSelector, categorySelector, subcategorySelector]() {
+                    if (reply->error() != QNetworkReply::NoError) {
+                        reply->deleteLater();
+                        return;
+                    }
+
+                    const QJsonObject response =
+                        QJsonDocument::fromJson(reply->readAll()).object();
+
+                    if (response.value(
+                                    QStringLiteral("status")
+                                    ).toString() != QStringLiteral("matched")) {
+                        reply->deleteLater();
+                        return;
+                    }
+
+                    const QJsonObject match =
+                        response.value(QStringLiteral("match")).toObject();
+
+                    levelSelector->setCurrentText(
+                        match.value(QStringLiteral("level")).toString()
+                        );
+
+                    categorySelector->setCurrentText(
+                        match.value(QStringLiteral("category")).toString()
+                        );
+
+                    subcategorySelector->setCurrentText(
+                        match.value(QStringLiteral("subcategory")).toString()
+                        );
+
+                    queueStatus->setText(
+                        QStringLiteral("Match found: %1 — %2 — %3")
+                            .arg(match.value(
+                                          QStringLiteral("level")
+                                          ).toString())
+                            .arg(match.value(
+                                          QStringLiteral("category")
+                                          ).toString())
+                            .arg(match.value(
+                                          QStringLiteral("subcategory")
+                                          ).toString())
+                        );
+
+                    matchPollTimer->stop();
+                    randomQueueButton->setEnabled(false);
+                    rulesetQueueButton->setEnabled(false);
+                    reply->deleteLater();
+                }
+                );
+        }
+        );
+
+    QObject::connect(
+        randomQueueButton,
+        &QPushButton::clicked,
+        &window,
+        [networkManager, displayNameInput, randomQueueButton, queueStatus,
+         levelSelector, categorySelector, subcategorySelector, matchPollTimer,
+         playerId]() {
+            const QString displayName =
+                displayNameInput->text().trimmed();
+
+            if (displayName.isEmpty()) {
+                queueStatus->setText(
+                    QStringLiteral("Matchmaking: enter a display name first")
+                    );
+                return;
+            }
+
+            randomQueueButton->setEnabled(false);
+
+            queueStatus->setText(
+                QStringLiteral("Matchmaking: joining random queue...")
+                );
+
+            const QJsonObject requestBody{
+                {QStringLiteral("playerId"), playerId},
+                {QStringLiteral("displayName"), displayName},
+                {QStringLiteral("queueType"), QStringLiteral("random")}
+            };
+
+            QNetworkRequest request(
+                QUrl(QStringLiteral("http://127.0.0.1:3000/queue"))
+                );
+
+            request.setHeader(
+                QNetworkRequest::ContentTypeHeader,
+                QStringLiteral("application/json")
+                );
+
+            auto *reply = networkManager->post(
+                request,
+                QJsonDocument(requestBody).toJson(QJsonDocument::Compact)
+                );
+
+            QObject::connect(
+                reply,
+                &QNetworkReply::finished,
+                [reply, randomQueueButton, queueStatus, matchPollTimer,
+                levelSelector, categorySelector, subcategorySelector]() {
+                    if (reply->error() != QNetworkReply::NoError) {
+                        queueStatus->setText(
+                            QStringLiteral("Matchmaking: server request failed")
+                            );
+
+                        randomQueueButton->setEnabled(true);
+                        reply->deleteLater();
+                        return;
+                    }
+
+                    const QJsonObject response =
+                        QJsonDocument::fromJson(reply->readAll()).object();
+
+                    const QString responseStatus =
+                        response.value(QStringLiteral("status")).toString();
+
+                    if (responseStatus == QStringLiteral("waiting")) {
+                        queueStatus->setText(
+                            QStringLiteral("Matchmaking: waiting for opponent")
+                            );
+
+                        matchPollTimer->start();
+
+                    } else if (responseStatus == QStringLiteral("matched")) {
+                        const QJsonObject match =
+                            response.value(QStringLiteral("match")).toObject();
+
+                        levelSelector->setCurrentText(
+                            match.value(QStringLiteral("level")).toString()
+                            );
+
+                        categorySelector->setCurrentText(
+                            match.value(QStringLiteral("category")).toString()
+                            );
+
+                        subcategorySelector->setCurrentText(
+                            match.value(QStringLiteral("subcategory")).toString()
+                            );
+
+                        queueStatus->setText(
+                            QStringLiteral("Match found: %1 — %2 — %3")
+                                .arg(match.value(
+                                              QStringLiteral("level")
+                                              ).toString())
+                                .arg(match.value(
+                                              QStringLiteral("category")
+                                              ).toString())
+                                .arg(match.value(
+                                              QStringLiteral("subcategory")
+                                              ).toString())
+                            );
+                    } else {
+                        queueStatus->setText(
+                            QStringLiteral("Matchmaking: ")
+                            + response.value(
+                                          QStringLiteral("error")
+                                          ).toString()
+                            );
+
+                        randomQueueButton->setEnabled(true);
+                    }
+
+                    reply->deleteLater();
+                }
+                );
+        }
+        );
+
+    QObject::connect(
+        rulesetQueueButton,
+        &QPushButton::clicked,
+        &window,
+        [networkManager, displayNameInput, randomQueueButton,
+         rulesetQueueButton, queueStatus, levelSelector,
+         categorySelector, subcategorySelector, matchPollTimer,
+         playerId]() {
+            const QString displayName =
+                displayNameInput->text().trimmed();
+
+            if (displayName.isEmpty()) {
+                queueStatus->setText(
+                    QStringLiteral("Matchmaking: enter a display name first")
+                    );
+                return;
+            }
+
+            randomQueueButton->setEnabled(false);
+            rulesetQueueButton->setEnabled(false);
+
+            queueStatus->setText(
+                QStringLiteral("Matchmaking: joining selected ruleset queue...")
+                );
+
+            const QJsonObject requestBody{
+                {QStringLiteral("playerId"), playerId},
+                {QStringLiteral("displayName"), displayName},
+                {QStringLiteral("queueType"), QStringLiteral("ruleset")},
+                {QStringLiteral("category"), categorySelector->currentText()},
+                {QStringLiteral(
+                     "subcategory"
+                     ), subcategorySelector->currentText()}
+            };
+
+            QNetworkRequest request(
+                QUrl(QStringLiteral("http://127.0.0.1:3000/queue"))
+                );
+
+            request.setHeader(
+                QNetworkRequest::ContentTypeHeader,
+                QStringLiteral("application/json")
+                );
+
+            auto *reply = networkManager->post(
+                request,
+                QJsonDocument(requestBody).toJson(QJsonDocument::Compact)
+                );
+
+            QObject::connect(
+                reply,
+                &QNetworkReply::finished,
+                [reply, randomQueueButton, rulesetQueueButton,
+                 queueStatus, levelSelector, categorySelector,
+                 subcategorySelector, matchPollTimer]() {
+                    if (reply->error() != QNetworkReply::NoError) {
+                        queueStatus->setText(
+                            QStringLiteral("Matchmaking: server request failed")
+                            );
+
+                        randomQueueButton->setEnabled(true);
+                        rulesetQueueButton->setEnabled(true);
+                        reply->deleteLater();
+                        return;
+                    }
+
+                    const QJsonObject response =
+                        QJsonDocument::fromJson(reply->readAll()).object();
+
+                    const QString responseStatus =
+                        response.value(QStringLiteral("status")).toString();
+
+                    if (responseStatus == QStringLiteral("waiting")) {
+                        queueStatus->setText(
+                            QStringLiteral(
+                                "Matchmaking: waiting for ruleset opponent"
+                                )
+                            );
+
+                        matchPollTimer->start();
+                    } else if (responseStatus == QStringLiteral("matched")) {
+                        const QJsonObject match =
+                            response.value(QStringLiteral("match")).toObject();
+
+                        levelSelector->setCurrentText(
+                            match.value(QStringLiteral("level")).toString()
+                            );
+
+                        categorySelector->setCurrentText(
+                            match.value(QStringLiteral("category")).toString()
+                            );
+
+                        subcategorySelector->setCurrentText(
+                            match.value(QStringLiteral("subcategory")).toString()
+                            );
+
+                        queueStatus->setText(
+                            QStringLiteral("Match found: %1 — %2 — %3")
+                                .arg(match.value(
+                                              QStringLiteral("level")
+                                              ).toString())
+                                .arg(match.value(
+                                              QStringLiteral("category")
+                                              ).toString())
+                                .arg(match.value(
+                                              QStringLiteral("subcategory")
+                                              ).toString())
+                            );
+
+                        matchPollTimer->stop();
+                    } else {
+                        queueStatus->setText(
+                            QStringLiteral("Matchmaking: ")
+                            + response.value(
+                                          QStringLiteral("error")
+                                          ).toString()
+                            );
+
+                        randomQueueButton->setEnabled(true);
+                        rulesetQueueButton->setEnabled(true);
+                    }
+
+                    reply->deleteLater();
+                }
+                );
         }
         );
 
