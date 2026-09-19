@@ -6,6 +6,7 @@
 #include <QFont>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QDialog>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMainWindow>
@@ -409,21 +410,16 @@ int main(int argc, char *argv[])
     QMainWindow window;
     window.setWindowTitle(QStringLiteral("TRASR"));
 
-    auto *content = new QWidget;
-    auto *layout = new QVBoxLayout(content);
+    QDialog loginDialog(&window);
+    loginDialog.setWindowTitle(QStringLiteral("TRSR login"));
+    loginDialog.setModal(true);
 
-    auto *displayNameLabel = new QLabel(
-        QStringLiteral("Display name")
-        );
+    auto *loginLayout = new QVBoxLayout(&loginDialog);
 
-    auto *displayNameInput = new QLineEdit;
-    displayNameInput->setPlaceholderText(
-        QStringLiteral("Choose a name")
+    auto *loginIntro = new QLabel(
+        QStringLiteral("Link your Speedrun.com account to use TRSR matchmaking.")
         );
-
-    displayNameInput->setText(
-        settings.value(QStringLiteral("displayName")).toString()
-        );
+    loginIntro->setWordWrap(true);
 
     auto *speedrunApiKeyLabel = new QLabel(
         QStringLiteral("Speedrun.com API key")
@@ -440,10 +436,23 @@ int main(int argc, char *argv[])
         );
 
     auto *speedrunStatus = new QLabel(
+        QStringLiteral("Speedrun.com: checking saved login...")
+        );
+    speedrunStatus->setAlignment(Qt::AlignCenter);
+
+    loginLayout->addWidget(loginIntro);
+    loginLayout->addWidget(speedrunApiKeyLabel);
+    loginLayout->addWidget(speedrunApiKeyInput);
+    loginLayout->addWidget(linkSpeedrunButton);
+    loginLayout->addWidget(speedrunStatus);
+
+    auto *accountStatus = new QLabel(
         QStringLiteral("Speedrun.com: not linked")
         );
+    accountStatus->setAlignment(Qt::AlignCenter);
 
-    speedrunStatus->setAlignment(Qt::AlignCenter);
+    auto *content = new QWidget;
+    auto *layout = new QVBoxLayout(content);
 
     auto *levelLabel = new QLabel(QStringLiteral("Level"));
     auto *levelSelector = new QComboBox;
@@ -579,12 +588,7 @@ int main(int argc, char *argv[])
 
     refreshSelection();
 
-    layout->addWidget(displayNameLabel);
-    layout->addWidget(displayNameInput);
-    layout->addWidget(speedrunApiKeyLabel);
-    layout->addWidget(speedrunApiKeyInput);
-    layout->addWidget(linkSpeedrunButton);
-    layout->addWidget(speedrunStatus);
+    layout->addWidget(accountStatus);
     layout->addWidget(levelLabel);
     layout->addWidget(levelSelector);
     layout->addWidget(categoryLabel);
@@ -612,12 +616,80 @@ int main(int argc, char *argv[])
             )
         );
 
+    const QString savedSessionToken =
+        settings.value(QStringLiteral("matchmaking/sessionToken")).toString();
+
+    if (savedSessionToken.isEmpty()) {
+        speedrunStatus->setText(
+            QStringLiteral("Link your Speedrun.com account to continue.")
+            );
+    } else {
+        QJsonObject sessionRequestBody;
+        sessionRequestBody.insert(
+            QStringLiteral("sessionToken"),
+            savedSessionToken
+            );
+
+        QNetworkRequest sessionRequest{
+            QUrl(QStringLiteral("https://api.trsr.app/auth/session"))
+        };
+        sessionRequest.setHeader(
+            QNetworkRequest::ContentTypeHeader,
+            QStringLiteral("application/json")
+            );
+
+        auto *sessionReply = networkManager->post(
+            sessionRequest,
+            QJsonDocument(sessionRequestBody).toJson(QJsonDocument::Compact)
+            );
+
+        QObject::connect(
+            sessionReply,
+            &QNetworkReply::finished,
+            [sessionReply, speedrunStatus, accountStatus, &loginDialog]() {
+                const QJsonObject response =
+                    QJsonDocument::fromJson(sessionReply->readAll()).object();
+
+                if (sessionReply->error() != QNetworkReply::NoError
+                    || response.value(QStringLiteral("status")).toString()
+                           != QStringLiteral("valid")) {
+                    QSettings settings;
+                    settings.remove(QStringLiteral("matchmaking/sessionToken"));
+                    settings.remove(QStringLiteral("matchmaking/speedrunUserId"));
+
+                    speedrunStatus->setText(
+                        QStringLiteral("Link your Speedrun.com account to continue.")
+                        );
+                    sessionReply->deleteLater();
+                    return;
+                }
+
+                const QJsonObject profile =
+                    response.value(QStringLiteral("profile")).toObject();
+                const QString displayName =
+                    profile.value(QStringLiteral("displayName")).toString();
+
+                accountStatus->setText(
+                    QStringLiteral("Speedrun.com: linked as %1")
+                        .arg(displayName)
+                    );
+                speedrunStatus->setText(
+                    QStringLiteral("Speedrun.com: linked as %1")
+                        .arg(displayName)
+                    );
+
+                loginDialog.accept();
+                sessionReply->deleteLater();
+            }
+            );
+    }
+
     QObject::connect(
         linkSpeedrunButton,
         &QPushButton::clicked,
-        &window,
+        &loginDialog,
         [networkManager, speedrunApiKeyInput, linkSpeedrunButton,
-         speedrunStatus, displayNameInput]() {
+         speedrunStatus, accountStatus, &loginDialog]() {
             const QString apiKey = speedrunApiKeyInput->text().trimmed();
 
             if (apiKey.isEmpty()) {
@@ -652,7 +724,7 @@ int main(int argc, char *argv[])
                 reply,
                 &QNetworkReply::finished,
                 [reply, speedrunApiKeyInput, linkSpeedrunButton,
-                 speedrunStatus, displayNameInput]() {
+                 speedrunStatus, accountStatus, &loginDialog]() {
                     const QJsonObject response =
                         QJsonDocument::fromJson(reply->readAll()).object();
 
@@ -696,18 +768,19 @@ int main(int argc, char *argv[])
                         QStringLiteral("matchmaking/speedrunUserId"),
                         profile.value(QStringLiteral("id")).toString()
                         );
-                    settings.setValue(
-                        QStringLiteral("displayName"),
-                        displayName
-                        );
-
-                    displayNameInput->setText(displayName);
                     speedrunApiKeyInput->clear();
 
                     speedrunStatus->setText(
                         QStringLiteral("Speedrun.com: linked as %1")
                             .arg(displayName)
                         );
+
+                    accountStatus->setText(
+                        QStringLiteral("Speedrun.com: linked as %1")
+                            .arg(displayName)
+                        );
+
+                    loginDialog.accept();
 
                     reply->deleteLater();
                 }
@@ -928,7 +1001,7 @@ int main(int argc, char *argv[])
         rulesetQueueButton,
         &QPushButton::clicked,
         &window,
-        [networkManager, displayNameInput, randomQueueButton,
+        [networkManager, randomQueueButton,
          rulesetQueueButton, queueStatus, levelSelector,
          categorySelector, subcategorySelector, matchPollTimer,
          playerId]() {
@@ -1326,6 +1399,12 @@ int main(int argc, char *argv[])
                 );
         }
         );
+
+    loginDialog.resize(380, 180);
+
+    if (loginDialog.exec() != QDialog::Accepted) {
+        return 0;
+    }
 
     timer.start(100);
     updateStatus();
