@@ -10,7 +10,6 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QMainWindow>
-#include <QMessageBox>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
@@ -379,11 +378,54 @@ static QString expectedLevelCode(int levelIndex)
 static QString formatIgt(float seconds)
 {
     const int totalSeconds = static_cast<int>(seconds);
-
     return QStringLiteral("%1:%2")
         .arg(totalSeconds / 60, 2, 10, QChar('0'))
         .arg(totalSeconds % 60, 2, 10, QChar('0'));
 }
+
+// A return value is present only after the corresponding completion portal has
+// been observed and verified. Empty means automatic finish is not supported yet.
+static QString expectedEndTriggerCode(int levelIndex)
+{
+    switch (levelIndex) {
+    case 1: return QStringLiteral("pu11"); // City of Vilcabamba
+    case 2: return QStringLiteral("pu16"); // The Lost Valley
+    case 3: return QStringLiteral("cn3"); // Tomb of Qualopec
+    case 4: return QStringLiteral("gr31"); // St. Francis Folly
+    case 5: return QStringLiteral("gr18"); // The Coliseum
+    case 7: return QStringLiteral("gr32"); // Tomb of Tihocan
+    case 10: return QStringLiteral("cn7"); // Sanctuary of the Scion
+    case 13: return QStringLiteral("cn8"); // Final Conflict
+    case 14: return QStringLiteral("ma15"); // Croft Manor
+    default: return {};
+    }
+}
+
+// Save a verified completed attempt and update the local PB cache.
+static bool saveCompletedAttempt(
+    const QString &level, const QString &category, const QString &subcategory,
+    float igt, const QString &buildHash, bool *isPersonalBest, QString *error
+    )
+{
+    if (!appendAttempt(
+            AttemptRecord{level, category, subcategory, igt, buildHash}, error)) {
+        return false;
+    }
+
+    QSettings settings;
+    const QString bestKey = bestIgtKey(level, category, subcategory);
+    const float previousBest = settings.value(bestKey, -1.0f).toFloat();
+    *isPersonalBest = previousBest < 0.0f || igt < previousBest;
+    settings.setValue(lastIgtKey(level, category, subcategory), igt);
+
+    if (*isPersonalBest) {
+        settings.setValue(bestKey, igt);
+    }
+
+    return true;
+}
+
+
 
 int main(int argc, char *argv[])
 {
@@ -563,15 +605,9 @@ int main(int argc, char *argv[])
     statusFont.setBold(true);
     status->setFont(statusFont);
 
-    auto *confirmButton = new QPushButton(
-        QStringLiteral("Confirm finish")
-        );
-    confirmButton->setEnabled(false);
-
-    // Save a changed ruleset and load its matching local PB.
+    // Save a changed ruleset between launches.
     auto refreshSelection =
-        [levelSelector, categorySelector, subcategorySelector,
-         confirmButton]() {
+        [levelSelector, categorySelector, subcategorySelector]() {
             QSettings settings;
 
             const QString level = levelSelector->currentText();
@@ -585,13 +621,6 @@ int main(int argc, char *argv[])
                 subcategory
                 );
 
-            confirmButton->setProperty(
-                "bestIgt",
-                settings.value(
-                            bestIgtKey(level, category, subcategory),
-                            -1.0f
-                            ).toFloat()
-                );
         };
 
     refreshSelection();
@@ -610,7 +639,6 @@ int main(int argc, char *argv[])
     layout->addWidget(cancelQueueButton);
     layout->addWidget(queueStatus);
     layout->addWidget(status);
-    layout->addWidget(confirmButton);
 
     window.setCentralWidget(content);
 
@@ -1239,12 +1267,15 @@ int main(int argc, char *argv[])
     // helps distinguish normal play from pauses and loading transitions.
     auto updateStatus =
         [status, levelSelector, categorySelector, subcategorySelector,
-         confirmButton, previousGameTime = -1.0f,
-         unchangedPolls = 0]() mutable {
+         previousGameTime = -1.0f, unchangedPolls = 0,
+         activeSelectionKey = QString(), levelVerifiedThisRun = false,
+         finishArmed = false, finishMessage = QString()]() mutable {
             const auto process = findTraProcess();
 
             if (!process.has_value()) {
-                confirmButton->setEnabled(false);
+                levelVerifiedThisRun = false;
+                finishArmed = false;
+                finishMessage.clear();
 
                 status->setText(
                     QStringLiteral("Tomb Raider: Anniversary\nnot running")
@@ -1267,6 +1298,18 @@ int main(int argc, char *argv[])
                     ? process->currentPositionCode
                     : QStringLiteral("--");
 
+            const QString selectedRunKey =
+                levelSelector->currentText() + QStringLiteral("\n")
+                + categorySelector->currentText() + QStringLiteral("\n")
+                + subcategorySelector->currentText();
+
+            if (selectedRunKey != activeSelectionKey) {
+                activeSelectionKey = selectedRunKey;
+                levelVerifiedThisRun = false;
+                finishArmed = false;
+                finishMessage.clear();
+            }
+
             const QString selectedLevelCode =
                 expectedLevelCode(levelSelector->currentIndex());
 
@@ -1275,19 +1318,33 @@ int main(int argc, char *argv[])
             const bool expectedLevelIsActive =
                 !selectedLevelCode.isEmpty()
                 && process->loadedLevelAvailable
-                && process->currentPositionAvailable
-                && process->loadedLevelCode == selectedLevelCode
-                && process->currentPositionCode == selectedLevelCode;
+                && process->loadedLevelCode.compare(
+                       selectedLevelCode,
+                       Qt::CaseInsensitive
+                       ) == 0;
+
+            // Retain verification through the legitimate end-trigger/loading
+            // transition once the selected level has been observed.
+            if (expectedLevelIsActive) {
+                levelVerifiedThisRun = true;
+            }
 
             const QString levelVerificationStatus =
                 selectedLevelCode.isEmpty()
                     ? QStringLiteral("Level verification: mapping needed")
-                    : expectedLevelIsActive
+                    : levelVerifiedThisRun
                           ? QStringLiteral("Level verification: passed")
                           : QStringLiteral("Level verification: failed");
 
-            const float bestIgt =
-                confirmButton->property("bestIgt").toFloat();
+            QSettings settings;
+            const float bestIgt = settings.value(
+                bestIgtKey(
+                    levelSelector->currentText(),
+                    categorySelector->currentText(),
+                    subcategorySelector->currentText()
+                    ),
+                -1.0f
+                ).toFloat();
 
             const QString bestIgtStatus =
                 bestIgt >= 0.0f
@@ -1320,40 +1377,58 @@ int main(int argc, char *argv[])
 
             previousGameTime = process->gameTime;
 
-            // A frozen IGT can mean pause, loading, or finish. Manual confirmation
-            // remains necessary until each level's real completion transition is
-            // mapped and verified.
-            const bool finishCandidate =
-                process->gameTimeAvailable
-                && process->gameTime > 0.0f
-                && unchangedPolls > 20;
-
-            const QVariant confirmedValue =
-                confirmButton->property("confirmedCandidateIgt");
-
-            const bool alreadyConfirmed =
-                confirmedValue.isValid()
-                && confirmedValue.toFloat() == process->gameTime;
-
             // TRAE-Menu-Hook.asi blocks attempt confirmation.
             const bool integrityPassed = process->blockedModule.isEmpty();
 
-            confirmButton->setEnabled(
-                finishCandidate
-                && !alreadyConfirmed
-                && integrityPassed
-                );
+            const QString endTriggerCode =
+                expectedEndTriggerCode(levelSelector->currentIndex());
 
-            if (finishCandidate) {
-                confirmButton->setProperty(
-                    "candidateIgt",
-                    process->gameTime
-                    );
+            const bool onEndTrigger =
+                !endTriggerCode.isEmpty()
+                && process->currentPositionAvailable
+                && process->currentPositionCode.compare(
+                       endTriggerCode,
+                       Qt::CaseInsensitive
+                       ) == 0;
 
-                confirmButton->setProperty(
-                    "buildHash",
-                    process->buildHash
-                    );
+            // Arm after a valid run starts away from its completion portal.
+            // This prevents stale portal data from recording a duplicate attempt.
+            if (levelVerifiedThisRun
+                && expectedLevelIsActive
+                && process->gameTimeAvailable
+                && process->gameTime > 0.0f
+                && !onEndTrigger) {
+                finishArmed = true;
+                finishMessage.clear();
+            }
+
+            if (finishArmed
+                && onEndTrigger
+                && process->gameTimeAvailable
+                && process->gameTime > 0.0f
+                && integrityPassed) {
+                bool isPersonalBest = false;
+                QString saveError;
+
+                if (saveCompletedAttempt(
+                        levelSelector->currentText(),
+                        categorySelector->currentText(),
+                        subcategorySelector->currentText(),
+                        process->gameTime,
+                        process->buildHash,
+                        &isPersonalBest,
+                        &saveError)) {
+                    finishMessage = isPersonalBest
+                        ? QStringLiteral("Finish saved — New PB: ")
+                              + formatIgt(process->gameTime)
+                        : QStringLiteral("Finish saved: ")
+                              + formatIgt(process->gameTime);
+                } else {
+                    finishMessage = QStringLiteral("Finish not saved: ")
+                        + saveError;
+                }
+
+                finishArmed = false;
             }
 
             const QString integrityStatus =
@@ -1370,8 +1445,9 @@ int main(int argc, char *argv[])
 
             // Keep one fixed layout. The central line changes with the game state,
             // so the window does not resize when leaving the main menu.
-            const QString activityStatus =
-                isInMainMenu ? QStringLiteral("Main Menu") : runStatus;
+            const QString activityStatus = !finishMessage.isEmpty()
+                ? finishMessage
+                : isInMainMenu ? QStringLiteral("Main Menu") : runStatus;
 
             status->setText(
                 QStringLiteral(
@@ -1392,86 +1468,6 @@ int main(int argc, char *argv[])
 
     QTimer timer;
     QObject::connect(&timer, &QTimer::timeout, &window, updateStatus);
-
-    // A confirmed finish writes a durable JSON attempt before it updates the
-    // convenient local PB cache.
-    QObject::connect(
-        confirmButton,
-        &QPushButton::clicked,
-        &window,
-        [levelSelector, categorySelector, subcategorySelector,
-         confirmButton]() {
-            const float candidateIgt =
-                confirmButton->property("candidateIgt").toFloat();
-
-            const QString level = levelSelector->currentText();
-            const QString category = categorySelector->currentText();
-            const QString subcategory = subcategorySelector->currentText();
-
-            const QString buildHash =
-                confirmButton->property("buildHash").toString();
-
-            QString logError;
-
-            if (!appendAttempt(
-                    AttemptRecord{
-                        level,
-                        category,
-                        subcategory,
-                        candidateIgt,
-                        buildHash
-                    },
-                    &logError)) {
-                QMessageBox::warning(
-                    confirmButton,
-                    QStringLiteral("Attempt not saved"),
-                    logError
-                    );
-                return;
-            }
-
-            // Prevent duplicate confirmation for the same frozen IGT value.
-            confirmButton->setProperty(
-                "confirmedCandidateIgt",
-                candidateIgt
-                );
-
-            QSettings settings;
-
-            const QString bestKey =
-                bestIgtKey(level, category, subcategory);
-
-            const float previousBest =
-                settings.value(bestKey, -1.0f).toFloat();
-
-            const bool isPersonalBest =
-                previousBest < 0.0f || candidateIgt < previousBest;
-
-            settings.setValue(
-                lastIgtKey(level, category, subcategory),
-                candidateIgt
-                );
-
-            if (isPersonalBest) {
-                settings.setValue(bestKey, candidateIgt);
-                confirmButton->setProperty("bestIgt", candidateIgt);
-            }
-
-            const QString message =
-                isPersonalBest
-                    ? QStringLiteral("New PB: ")
-                    : QStringLiteral("Confirmed IGT: ");
-
-            QMessageBox::information(
-                nullptr,
-                QStringLiteral("Finish confirmed"),
-                message + formatIgt(candidateIgt)
-                    + QStringLiteral("\n")
-                    + level + QStringLiteral("\n")
-                    + rulesetName(category, subcategory)
-                );
-        }
-        );
 
     loginDialog.resize(380, 180);
 
