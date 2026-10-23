@@ -13,6 +13,10 @@ qt_add_executable(TRASR
     main.cpp
     tra_process.cpp
     run_rules.cpp
+    trasr_window.cpp
+    run_monitor.cpp
+    run_monitor.h
+    trasr_window.h
     tra_process.h
     run_rules.h
 )
