@@ -1,9 +1,8 @@
 #include <QApplication>
-#include <QByteArray>
 #include "attempt_log.h"
+#include "tra_process.h"
+#include "run_rules.h"
 #include <QComboBox>
-#include <QCryptographicHash>
-#include <QFile>
 #include <QFont>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -21,775 +20,20 @@
 #include <QUuid>
 #include <QUrl>
 #include <QVBoxLayout>
-#include <QVector>
 #include <QWidget>
 
 #include <cmath>
-#include <cstring>
-#include <optional>
 
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#include <tlhelp32.h>
-
-// These addresses are only trusted for this exact Steam executable.
-static const QString kSupportedSteamBuildSha256 =
-    QStringLiteral(
-        "7461663a67bc3b9e7324afbd1e0ac8d4e092bd7083ddf147231a42a790814b0e"
-        );
-
-static const QString kSupportedOriginalPcBuildSha256 =
-    QStringLiteral(
-        "5ca17c3a1e40d12a54392b984aa2df0d2ecfbc65c8eab0f06e361a195525e2ed"
-        );
-
-// Reverse-engineered memory addresses for the supported TRA build.
-static constexpr DWORD_PTR kLaraHealthAddress = 0x00665460;
-static constexpr DWORD_PTR kGameTimeAddress = 0x00665B10;
-static constexpr DWORD_PTR kLoadedLevelAddress = 0x008AE384;
-static constexpr DWORD_PTR kCurrentPositionAddress = 0x008AF450;
-
-// Known, read-only Anniversary Steam-build layout used to find the level's
-// signal mesh and Lara's centre. These offsets are guarded by the executable
-// hash below; TRASR never writes to the game process.
-static constexpr DWORD_PTR kGameTrackerAddress = 0x00838330;
-static constexpr DWORD_PTR kGameTrackerLevelOffset = 0x08;
-static constexpr DWORD_PTR kGameTrackerPlayerOffset = 0x0C;
-static constexpr DWORD_PTR kLevelTerrainOffset = 0x00;
-static constexpr DWORD_PTR kTerrainSignalGroupOffset = 0x1C;
-static constexpr DWORD_PTR kTerrainGroupMeshOffset = 0x3C;
-static constexpr DWORD_PTR kMeshPositionOffset = 0x20;
-static constexpr DWORD_PTR kMeshVerticesOffset = 0x30;
-static constexpr DWORD_PTR kMeshFacesOffset = 0x34;
-static constexpr DWORD_PTR kMeshVertexTypeOffset = 0x40;
-static constexpr DWORD_PTR kMeshFaceCountOffset = 0x44;
-static constexpr DWORD_PTR kMeshVertexCountOffset = 0x46;
-static constexpr DWORD_PTR kPlayerPositionOffset = 0x10;
-
-// A read-only snapshot of the running TRA process.
-struct TraProcess
-{
-    DWORD processId;
-    QString executablePath;
-    QString buildHash;
-    QString blockedModule;
-
-    float laraHealth;
-    bool healthAvailable;
-
-    float gameTime;
-    bool gameTimeAvailable;
-
-    QString loadedLevelCode;
-    bool loadedLevelAvailable;
-
-    QString currentPositionCode;
-    bool currentPositionAvailable;
-
-    int crossedSignalId;
-    bool signalCrossingAvailable;
-};
-
-struct RemoteVector3
-{
-    float x;
-    float y;
-    float z;
-    float w;
-};
-
-struct RemoteSignalFace
-{
-    quint16 i0;
-    quint16 i1;
-    quint16 i2;
-    quint8 adjacencyFlags;
-    quint8 collisionFlags;
-    quint16 id;
-};
-
-struct SignalTriangle
-{
-    RemoteVector3 a;
-    RemoteVector3 b;
-    RemoteVector3 c;
-    quint16 id;
-};
-
-static_assert(sizeof(RemoteVector3) == 16);
-static_assert(sizeof(RemoteSignalFace) == 10);
-
-struct SignalDetectionCache
-{
-    DWORD processId = 0;
-    DWORD_PTR meshAddress = 0;
-    QVector<SignalTriangle> triangles;
-    RemoteVector3 previousPlayerPosition{};
-    bool hasPreviousPlayerPosition = false;
-};
-
-static SignalDetectionCache s_signalDetectionCache;
-
-static QString rulesetName(
-    const QString &category,
-    const QString &subcategory
-    )
-{
-    return category + QStringLiteral(" — ") + subcategory;
-}
-
-// QSettings keys for a PB and the most recently confirmed attempt.
-static QString bestIgtKey(
-    const QString &level,
-    const QString &category,
-    const QString &subcategory
-    )
-{
-    return QStringLiteral("results/")
-    + level + QStringLiteral("/")
-        + category + QStringLiteral("/")
-        + subcategory + QStringLiteral("/bestIgt");
-}
-
-static QString lastIgtKey(
-    const QString &level,
-    const QString &category,
-    const QString &subcategory
-    )
-{
-    return QStringLiteral("results/")
-    + level + QStringLiteral("/")
-        + category + QStringLiteral("/")
-        + subcategory + QStringLiteral("/lastIgt");
-}
-
-// The game executable rarely changes while TRASR is open, so cache its hash.
-static QString sha256ForFile(const QString &filePath)
-{
-    static QString cachedPath;
-    static QString cachedHash;
-
-    if (filePath == cachedPath && !cachedHash.isEmpty()) {
-        return cachedHash;
-    }
-
-    QFile file(filePath);
-
-    if (!file.open(QIODevice::ReadOnly)) {
-        return QStringLiteral("Hash unavailable");
-    }
-
-    QCryptographicHash hash(QCryptographicHash::Sha256);
-
-    while (!file.atEnd()) {
-        hash.addData(file.read(64 * 1024));
-    }
-
-    cachedPath = filePath;
-    cachedHash = hash.result().toHex();
-
-    return cachedHash;
-}
-
-// Ranked integrity check.
-// This only lists modules loaded in TRA; TRASR never injects into or writes to it.
-static QString blockedModuleName(DWORD processId)
-{
-    HANDLE snapshot = CreateToolhelp32Snapshot(
-        TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
-        processId
-        );
-
-    if (snapshot == INVALID_HANDLE_VALUE) {
-        return {};
-    }
-
-    MODULEENTRY32W module{};
-    module.dwSize = sizeof(module);
-
-    QString blockedModule;
-
-    if (Module32FirstW(snapshot, &module)) {
-        do {
-            const QString moduleName =
-                QString::fromWCharArray(module.szModule);
-
-            if (moduleName.compare(
-                    QStringLiteral("TRAE-Menu-Hook.asi"),
-                    Qt::CaseInsensitive
-                    ) == 0) {
-                blockedModule = moduleName;
-                break;
-            }
-        } while (Module32NextW(snapshot, &module));
-    }
-
-    CloseHandle(snapshot);
-    return blockedModule;
-}
-
-// Reads TRA's fixed 32-byte ASCII level-state fields, such as "lc11".
-// The extra byte in text ensures QString always receives a null-terminated string.
-static bool readFixedGameString(
-    HANDLE processHandle,
-    DWORD_PTR address,
-    QString *value
-    )
-{
-    char text[33] = {};
-    SIZE_T bytesRead = 0;
-
-    const bool readSucceeded = ReadProcessMemory(
-                                   processHandle,
-                                   reinterpret_cast<LPCVOID>(address),
-                                   text,
-                                   32,
-                                   &bytesRead
-                                   ) && bytesRead == 32;
-
-    if (!readSucceeded) {
-        return false;
-    }
-
-    *value = QString::fromLatin1(text);
-    return true;
-}
-
-// Reads a primitive value from the target process without ever writing to it.
-template <typename T>
-static bool readRemoteValue(HANDLE processHandle, DWORD_PTR address, T *value)
-{
-    SIZE_T bytesRead = 0;
-    return ReadProcessMemory(
-               processHandle,
-               reinterpret_cast<LPCVOID>(address),
-               value,
-               sizeof(T),
-               &bytesRead
-               ) && bytesRead == sizeof(T);
-}
-
-static bool readRemotePointer(
-    HANDLE processHandle,
-    DWORD_PTR address,
-    DWORD_PTR *value
-    )
-{
-    quint32 remotePointer = 0;
-
-    if (!readRemoteValue(processHandle, address, &remotePointer)) {
-        return false;
-    }
-
-    *value = static_cast<DWORD_PTR>(remotePointer);
-    return remotePointer != 0;
-}
-
-static bool segmentIntersectsTriangle(
-    const RemoteVector3 &start,
-    const RemoteVector3 &end,
-    const SignalTriangle &triangle,
-    float *distance
-    )
-{
-    const float directionX = end.x - start.x;
-    const float directionY = end.y - start.y;
-    const float directionZ = end.z - start.z;
-    const float edge1X = triangle.b.x - triangle.a.x;
-    const float edge1Y = triangle.b.y - triangle.a.y;
-    const float edge1Z = triangle.b.z - triangle.a.z;
-    const float edge2X = triangle.c.x - triangle.a.x;
-    const float edge2Y = triangle.c.y - triangle.a.y;
-    const float edge2Z = triangle.c.z - triangle.a.z;
-    const float pX = directionY * edge2Z - directionZ * edge2Y;
-    const float pY = directionZ * edge2X - directionX * edge2Z;
-    const float pZ = directionX * edge2Y - directionY * edge2X;
-    const float determinant = edge1X * pX + edge1Y * pY + edge1Z * pZ;
-
-    if (std::fabs(determinant) < 0.0001f) {
-        return false;
-    }
-
-    const float inverseDeterminant = 1.0f / determinant;
-    const float startToAX = start.x - triangle.a.x;
-    const float startToAY = start.y - triangle.a.y;
-    const float startToAZ = start.z - triangle.a.z;
-    const float u = (startToAX * pX + startToAY * pY + startToAZ * pZ)
-        * inverseDeterminant;
-
-    if (u < 0.0f || u > 1.0f) {
-        return false;
-    }
-
-    const float qX = startToAY * edge1Z - startToAZ * edge1Y;
-    const float qY = startToAZ * edge1X - startToAX * edge1Z;
-    const float qZ = startToAX * edge1Y - startToAY * edge1X;
-    const float qYValue = (directionX * qX + directionY * qY + directionZ * qZ)
-        * inverseDeterminant;
-
-    if (qYValue < 0.0f || u + qYValue > 1.0f) {
-        return false;
-    }
-
-    const float hitDistance = (edge2X * qX + edge2Y * qY + edge2Z * qZ)
-        * inverseDeterminant;
-
-    if (hitDistance < 0.0f || hitDistance > 1.0f) {
-        return false;
-    }
-
-    *distance = hitDistance;
-    return true;
-}
-
-static bool cacheSignalTriangles(
-    HANDLE processHandle,
-    DWORD processId,
-    DWORD_PTR meshAddress
-    )
-{
-    DWORD_PTR verticesAddress = 0;
-    DWORD_PTR facesAddress = 0;
-    RemoteVector3 meshPosition{};
-    quint16 vertexType = 0;
-    quint16 faceCount = 0;
-    quint16 vertexCount = 0;
-
-    if (!readRemotePointer(
-            processHandle,
-            meshAddress + kMeshVerticesOffset,
-            &verticesAddress)
-        || !readRemotePointer(
-            processHandle,
-            meshAddress + kMeshFacesOffset,
-            &facesAddress)
-        || !readRemoteValue(
-            processHandle,
-            meshAddress + kMeshPositionOffset,
-            &meshPosition)
-        || !readRemoteValue(
-            processHandle,
-            meshAddress + kMeshVertexTypeOffset,
-            &vertexType)
-        || !readRemoteValue(
-            processHandle,
-            meshAddress + kMeshFaceCountOffset,
-            &faceCount)
-        || !readRemoteValue(
-            processHandle,
-            meshAddress + kMeshVertexCountOffset,
-            &vertexCount)
-        || vertexCount < 3 || faceCount == 0
-        || vertexCount > 60000 || faceCount > 60000
-        || (vertexType != 0 && vertexType != 1)) {
-        return false;
-    }
-
-    const int vertexSize = vertexType == 0 ? 6 : 16;
-    QByteArray vertices(vertexCount * vertexSize, Qt::Uninitialized);
-    QByteArray faces(faceCount * static_cast<int>(sizeof(RemoteSignalFace)),
-                     Qt::Uninitialized);
-    SIZE_T bytesRead = 0;
-
-    if (!ReadProcessMemory(
-            processHandle,
-            reinterpret_cast<LPCVOID>(verticesAddress),
-            vertices.data(),
-            static_cast<SIZE_T>(vertices.size()),
-            &bytesRead)
-        || bytesRead != static_cast<SIZE_T>(vertices.size())) {
-        return false;
-    }
-
-    bytesRead = 0;
-    if (!ReadProcessMemory(
-            processHandle,
-            reinterpret_cast<LPCVOID>(facesAddress),
-            faces.data(),
-            static_cast<SIZE_T>(faces.size()),
-            &bytesRead)
-        || bytesRead != static_cast<SIZE_T>(faces.size())) {
-        return false;
-    }
-
-    auto vertexAt = [&vertices, vertexType, vertexSize, meshPosition](quint16 index) {
-        RemoteVector3 vertex{0.0f, 0.0f, 0.0f, 0.0f};
-        const char *source = vertices.constData() + index * vertexSize;
-
-        if (vertexType == 0) {
-            qint16 coordinates[3]{};
-            std::memcpy(coordinates, source, sizeof(coordinates));
-            vertex.x = static_cast<float>(coordinates[0]);
-            vertex.y = static_cast<float>(coordinates[1]);
-            vertex.z = static_cast<float>(coordinates[2]);
-        } else {
-            std::memcpy(&vertex, source, sizeof(RemoteVector3));
-        }
-
-        vertex.x += meshPosition.x;
-        vertex.y += meshPosition.y;
-        vertex.z += meshPosition.z;
-        return vertex;
-    };
-
-    QVector<SignalTriangle> triangles;
-    triangles.reserve(faceCount);
-
-    for (quint16 i = 0; i < faceCount; ++i) {
-        RemoteSignalFace face{};
-        std::memcpy(
-            &face,
-            faces.constData() + i * sizeof(RemoteSignalFace),
-            sizeof(face)
-            );
-
-        if (face.i0 >= vertexCount || face.i1 >= vertexCount
-            || face.i2 >= vertexCount) {
-            continue;
-        }
-
-        triangles.append(SignalTriangle{
-            vertexAt(face.i0), vertexAt(face.i1), vertexAt(face.i2), face.id
-            });
-    }
-
-    if (triangles.isEmpty()) {
-        return false;
-    }
-
-    s_signalDetectionCache.processId = processId;
-    s_signalDetectionCache.meshAddress = meshAddress;
-    s_signalDetectionCache.triangles = std::move(triangles);
-    s_signalDetectionCache.hasPreviousPlayerPosition = false;
-    return true;
-}
-
-// Returns the signal face Lara crossed since the prior poll, if any. This
-// reproduces the proven diagnostic geometry externally and remains read-only.
-static bool readCrossedSignal(
-    HANDLE processHandle,
-    DWORD processId,
-    int *crossedSignalId
-    )
-{
-    *crossedSignalId = -1;
-    DWORD_PTR levelAddress = 0;
-    DWORD_PTR playerAddress = 0;
-    DWORD_PTR terrainAddress = 0;
-    DWORD_PTR signalGroupAddress = 0;
-    DWORD_PTR meshAddress = 0;
-    RemoteVector3 playerPosition{};
-
-    if (!readRemotePointer(
-            processHandle,
-            kGameTrackerAddress + kGameTrackerLevelOffset,
-            &levelAddress)
-        || !readRemotePointer(
-            processHandle,
-            kGameTrackerAddress + kGameTrackerPlayerOffset,
-            &playerAddress)
-        || !readRemotePointer(
-            processHandle,
-            levelAddress + kLevelTerrainOffset,
-            &terrainAddress)
-        || !readRemotePointer(
-            processHandle,
-            terrainAddress + kTerrainSignalGroupOffset,
-            &signalGroupAddress)
-        || !readRemotePointer(
-            processHandle,
-            signalGroupAddress + kTerrainGroupMeshOffset,
-            &meshAddress)
-        || !readRemoteValue(
-            processHandle,
-            playerAddress + kPlayerPositionOffset,
-            &playerPosition)) {
-        return false;
-    }
-
-    if (s_signalDetectionCache.processId != processId
-        || s_signalDetectionCache.meshAddress != meshAddress) {
-        if (!cacheSignalTriangles(processHandle, processId, meshAddress)) {
-            return false;
-        }
-    }
-
-    if (s_signalDetectionCache.hasPreviousPlayerPosition) {
-        float firstHitDistance = 2.0f;
-
-        for (const SignalTriangle &triangle : s_signalDetectionCache.triangles) {
-            float hitDistance = 0.0f;
-            if (segmentIntersectsTriangle(
-                    s_signalDetectionCache.previousPlayerPosition,
-                    playerPosition,
-                    triangle,
-                    &hitDistance
-                    ) && hitDistance < firstHitDistance) {
-                firstHitDistance = hitDistance;
-                *crossedSignalId = triangle.id;
-            }
-        }
-    }
-
-    s_signalDetectionCache.previousPlayerPosition = playerPosition;
-    s_signalDetectionCache.hasPreviousPlayerPosition = true;
-    return true;
-}
-// Finds tra.exe and creates one current read-only snapshot for the UI.
-static std::optional<TraProcess> findTraProcess()
-{
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-
-    if (snapshot == INVALID_HANDLE_VALUE) {
-        return std::nullopt;
-    }
-
-    PROCESSENTRY32W process{};
-    process.dwSize = sizeof(process);
-
-    std::optional<TraProcess> result;
-
-    if (Process32FirstW(snapshot, &process)) {
-        do {
-            const QString processName =
-                QString::fromWCharArray(process.szExeFile);
-
-            if (processName.compare(
-                    QStringLiteral("tra.exe"),
-                    Qt::CaseInsensitive
-                    ) != 0) {
-                continue;
-            }
-
-            QString executablePath = QStringLiteral("Path unavailable");
-            QString buildHash = QStringLiteral("Hash unavailable");
-
-            float laraHealth = 0.0f;
-            bool healthAvailable = false;
-
-            float gameTime = 0.0f;
-            bool gameTimeAvailable = false;
-
-            QString loadedLevelCode;
-            bool loadedLevelAvailable = false;
-
-            QString currentPositionCode;
-            bool currentPositionAvailable = false;
-
-            int crossedSignalId = -1;
-            bool signalCrossingAvailable = false;
-
-            HANDLE processHandle = OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
-                FALSE,
-                process.th32ProcessID
-                );
-
-            if (processHandle != nullptr) {
-                wchar_t path[MAX_PATH];
-                DWORD pathLength = MAX_PATH;
-
-                if (QueryFullProcessImageNameW(
-                        processHandle,
-                        0,
-                        path,
-                        &pathLength)) {
-                    executablePath =
-                        QString::fromWCharArray(path, pathLength);
-                }
-
-                buildHash = sha256ForFile(executablePath);
-
-                // Health and IGT addresses are only known for the supported build.
-                if (buildHash == kSupportedSteamBuildSha256
-                    || buildHash == kSupportedOriginalPcBuildSha256) {
-                    SIZE_T bytesRead = 0;
-
-                    healthAvailable = ReadProcessMemory(
-                                          processHandle,
-                                          reinterpret_cast<LPCVOID>(kLaraHealthAddress),
-                                          &laraHealth,
-                                          sizeof(laraHealth),
-                                          &bytesRead
-                                          ) && bytesRead == sizeof(laraHealth);
-
-                    bytesRead = 0;
-
-                    gameTimeAvailable = ReadProcessMemory(
-                                            processHandle,
-                                            reinterpret_cast<LPCVOID>(kGameTimeAddress),
-                                            &gameTime,
-                                            sizeof(gameTime),
-                                            &bytesRead
-                                            ) && bytesRead == sizeof(gameTime);
-                }
-
-                // These strings let TRASR distinguish selected/preloaded levels
-                // from the level Lara is actually inside.
-                loadedLevelAvailable = readFixedGameString(
-                    processHandle,
-                    kLoadedLevelAddress,
-                    &loadedLevelCode
-                    );
-
-                currentPositionAvailable = readFixedGameString(
-                    processHandle,
-                    kCurrentPositionAddress,
-                    &currentPositionCode
-                    );
-
-                // Signal geometry is currently verified for the supported Steam build.
-                if (buildHash == kSupportedSteamBuildSha256) {
-                    signalCrossingAvailable = readCrossedSignal(
-                        processHandle,
-                        process.th32ProcessID,
-                        &crossedSignalId
-                        );
-                }
-
-                CloseHandle(processHandle);
-            }
-
-            const QString blockedModule =
-                blockedModuleName(process.th32ProcessID);
-
-            result = TraProcess{
-                process.th32ProcessID,
-                executablePath,
-                buildHash,
-                blockedModule,
-                laraHealth,
-                healthAvailable,
-                gameTime,
-                gameTimeAvailable,
-                loadedLevelCode,
-                loadedLevelAvailable,
-                currentPositionCode,
-                currentPositionAvailable,
-                crossedSignalId,
-                signalCrossingAvailable
-            };
-
-            break;
-        } while (Process32NextW(snapshot, &process));
-    }
-
-    CloseHandle(snapshot);
-    return result;
-}
-
-// The level dropdown has a fixed order. Add verified TRA level-code mappings here.
-// Unknown levels intentionally return empty until they have been tested.
-static QString expectedLevelCode(int levelIndex)
-{
-    switch (levelIndex) {
-    case 0:
-        return QStringLiteral("pu1"); // Mountain Caves
-
-    case 1:
-        return QStringLiteral("pu8"); // City of Vilcabamba
-
-    case 2:
-        return QStringLiteral("pu11"); // The Lost Valley
-
-    case 3:
-        return QStringLiteral("pu16"); // Tomb of Qualopec
-
-    case 4:
-        return QStringLiteral("gr1"); // St. Francis Folly
-
-    case 5:
-        return QStringLiteral("gr31"); // The Coliseum
-
-    case 6:
-        return QStringLiteral("gr18"); // Midas Palace
-
-    case 7:
-        return QStringLiteral("gr27"); // Tomb of Tihocan
-
-    case 8:
-        return QStringLiteral("eg1"); // Temple of Khamoon
-
-    case 9:
-        return QStringLiteral("eg11"); // Obelisk of Khamoon
-
-    case 10:
-        return QStringLiteral("eg20"); // Sanctuary of the Scion
-
-    case 11:
-        return QStringLiteral("lc1"); // Natla's Mines
-
-    case 12:
-        return QStringLiteral("lc11"); // The Great Pyramid
-
-    case 13:
-        return QStringLiteral("lc17"); // Final Conflict
-
-    case 14:
-        return QStringLiteral("ma1"); // Croft Manor
-
-    default:
-        return {};
-    }
-}
-
-static QString formatIgt(float seconds)
-{
-    const int totalSeconds = static_cast<int>(seconds);
-    return QStringLiteral("%1:%2")
-        .arg(totalSeconds / 60, 2, 10, QChar('0'))
-        .arg(totalSeconds % 60, 2, 10, QChar('0'));
-}
-
-// A return value is present only after the corresponding completion portal has
-// been observed and verified. Empty means automatic finish is not supported yet.
-static QString expectedEndTriggerCode(int levelIndex)
-{
-    switch (levelIndex) {
-    case 1: return QStringLiteral("pu11"); // City of Vilcabamba
-    case 2: return QStringLiteral("pu16"); // The Lost Valley
-    case 3: return QStringLiteral("cn3"); // Tomb of Qualopec
-    case 4: return QStringLiteral("gr31"); // St. Francis Folly
-    case 5: return QStringLiteral("gr18"); // The Coliseum
-    case 7: return QStringLiteral("gr32"); // Tomb of Tihocan
-    case 10: return QStringLiteral("cn7"); // Sanctuary of the Scion
-    case 13: return QStringLiteral("cn8"); // Final Conflict
-    case 14: return QStringLiteral("ma15"); // Croft Manor
-    default: return {};
-    }
-}
-
-// A signal is a level-local invisible trigger mesh. A value is added only after
-// it has been observed with the separate diagnostic hook and verified in-game.
-static int expectedEndSignalId(int levelIndex)
-{
-    switch (levelIndex) {
-    case 0: return 23; // Mountain Caves normal completion
-    default: return -1;
-    }
-}
-// Save a verified completed attempt and update the local PB cache.
+// Save a verified completed attempt locally until results are submitted to the
+// matchmaking service.
 static bool saveCompletedAttempt(
     const QString &level, const QString &category, const QString &subcategory,
-    float igt, const QString &buildHash, bool *isPersonalBest, QString *error
+    float igt, const QString &buildHash, QString *error
     )
 {
-    if (!appendAttempt(
-            AttemptRecord{level, category, subcategory, igt, buildHash}, error)) {
-        return false;
-    }
-
-    QSettings settings;
-    const QString bestKey = bestIgtKey(level, category, subcategory);
-    const float previousBest = settings.value(bestKey, -1.0f).toFloat();
-    *isPersonalBest = previousBest < 0.0f || igt < previousBest;
-    settings.setValue(lastIgtKey(level, category, subcategory), igt);
-
-    if (*isPersonalBest) {
-        settings.setValue(bestKey, igt);
-    }
-
-    return true;
+    return appendAttempt(
+        AttemptRecord{level, category, subcategory, igt, buildHash}, error
+        );
 }
 
 
@@ -801,7 +45,7 @@ int main(int argc, char *argv[])
     QCoreApplication::setOrganizationName(QStringLiteral("TRASR"));
     QCoreApplication::setApplicationName(QStringLiteral("TRASR"));
 
-    // QSettings stores selections and PBs between application launches.
+    // QSettings stores login and UI selections between application launches.
     QSettings settings;
 
     QString playerId =
@@ -1634,14 +878,20 @@ int main(int argc, char *argv[])
     // helps distinguish normal play from pauses and loading transitions.
     auto updateStatus =
         [status, levelSelector, categorySelector, subcategorySelector,
-         previousGameTime = -1.0f, unchangedPolls = 0,
-         activeSelectionKey = QString(), levelVerifiedThisRun = false,
-         finishArmed = false, finishMessage = QString()]() mutable {
+         previousGameTime = -1.0f, previousLevelCount = -1.0f,
+         unchangedPolls = 0, activeSelectionKey = QString(),
+         levelVerifiedThisRun = false,
+         finishArmed = false, finishHandled = false,
+         finishMessage = QString()]() mutable {
             const auto process = findTraProcess();
 
             if (!process.has_value()) {
+                previousGameTime = -1.0f;
+                previousLevelCount = -1.0f;
+                unchangedPolls = 0;
                 levelVerifiedThisRun = false;
                 finishArmed = false;
+                finishHandled = false;
                 finishMessage.clear();
 
                 status->setText(
@@ -1674,18 +924,27 @@ int main(int argc, char *argv[])
                 activeSelectionKey = selectedRunKey;
                 levelVerifiedThisRun = false;
                 finishArmed = false;
+                finishHandled = false;
                 finishMessage.clear();
+                previousLevelCount = -1.0f;
             }
 
             const QString selectedLevelCode =
                 expectedLevelCode(levelSelector->currentIndex());
 
             // TRA may preload the next level before Lara has left the old level.
-            // We require both codes to agree before calling a mapped level active.
+            // A run becomes eligible only when its loaded and current-position
+            // codes independently identify the selected level. This deliberately
+            // treats an unreadable or transitional state as unverified.
             const bool expectedLevelIsActive =
                 !selectedLevelCode.isEmpty()
                 && process->loadedLevelAvailable
+                && process->currentPositionAvailable
                 && process->loadedLevelCode.compare(
+                       selectedLevelCode,
+                       Qt::CaseInsensitive
+                       ) == 0
+                && process->currentPositionCode.compare(
                        selectedLevelCode,
                        Qt::CaseInsensitive
                        ) == 0;
@@ -1703,26 +962,37 @@ int main(int argc, char *argv[])
                           ? QStringLiteral("Level verification: passed")
                           : QStringLiteral("Level verification: failed");
 
-            QSettings settings;
-            const float bestIgt = settings.value(
-                bestIgtKey(
-                    levelSelector->currentText(),
-                    categorySelector->currentText(),
-                    subcategorySelector->currentText()
-                    ),
-                -1.0f
-                ).toFloat();
+            const bool gameTimeRewound =
+                process->gameTimeAvailable
+                && previousGameTime > 0.0f
+                && process->gameTime + 0.001f < previousGameTime;
 
-            const QString bestIgtStatus =
-                bestIgt >= 0.0f
-                    ? formatIgt(bestIgt)
-                    : QStringLiteral("--:--");
+            // A death or checkpoint reload can place Lara on the other side of
+            // a signal face. End the armed attempt before that movement is ever
+            // considered a completion.
+            if (gameTimeRewound) {
+                levelVerifiedThisRun = false;
+                finishArmed = false;
+                finishHandled = false;
+                finishMessage.clear();
+                previousLevelCount = -1.0f;
+            }
+
+            const bool levelCountAdvanced =
+                process->levelCountAvailable
+                && std::isfinite(process->levelCount)
+                && previousLevelCount >= 0.0f
+                && process->levelCount > previousLevelCount + 0.001f;
+
+            const bool endscreenVisible =
+                process->menuStateAvailable && process->menuState >= 1;
 
             QString runStatus;
 
             if (!process->gameTimeAvailable) {
                 runStatus = QStringLiteral("IGT unavailable");
                 previousGameTime = -1.0f;
+                previousLevelCount = -1.0f;
                 unchangedPolls = 0;
             } else if (process->gameTime <= 0.0f) {
                 runStatus = QStringLiteral("Waiting for level");
@@ -1758,55 +1028,85 @@ int main(int argc, char *argv[])
                        Qt::CaseInsensitive
                        ) == 0;
 
-            const int endSignalId =
-                expectedEndSignalId(levelSelector->currentIndex());
-
             const bool onEndSignal =
-                endSignalId >= 0
-                && process->signalCrossingAvailable
-                && process->crossedSignalId == endSignalId;
+                process->signalCrossingAvailable
+                && isExpectedEndSignal(
+                       levelSelector->currentIndex(),
+                       process->crossedSignalId
+                       );
 
-            const bool onEndTrigger = onEndPortal || onEndSignal;
+            // TRA commits its level counter on the result screen. Unlike a
+            // portal, this catches cutscene and QTE endings without guessing
+            // their intermediate position codes.
+            const bool onEndscreenCompletion =
+                levelCountAdvanced && endscreenVisible;
+
+            const bool onEndTrigger =
+                onEndPortal || onEndSignal || onEndscreenCompletion;
+
+            // Loading a save can also move game state forward. Never carry an
+            // armed attempt across that transition; it must be observed again
+            // from stable in-level state.
+            if (finishArmed && process->loadingAvailable && process->loading) {
+                finishArmed = false;
+                finishMessage = QStringLiteral("Run invalidated: loading observed");
+            }
 
             // Arm after a valid run starts away from its completion portal.
             // This prevents stale portal data from recording a duplicate attempt.
-            if (levelVerifiedThisRun
+            if (!finishHandled
+                && levelVerifiedThisRun
                 && expectedLevelIsActive
                 && process->gameTimeAvailable
                 && process->gameTime > 0.0f
+                && !gameTimeRewound
+                && process->healthAvailable
+                && process->laraHealth > 0.0f
+                && (!process->loadingAvailable || !process->loading)
                 && !onEndTrigger) {
                 finishArmed = true;
                 finishMessage.clear();
             }
 
-            if (finishArmed
+            if (!finishHandled
+                && finishArmed
                 && onEndTrigger
                 && process->gameTimeAvailable
                 && process->gameTime > 0.0f
-                && integrityPassed) {
-                bool isPersonalBest = false;
-                QString saveError;
-
-                if (saveCompletedAttempt(
-                        levelSelector->currentText(),
-                        categorySelector->currentText(),
-                        subcategorySelector->currentText(),
-                        process->gameTime,
-                        process->buildHash,
-                        &isPersonalBest,
-                        &saveError)) {
-                    finishMessage = isPersonalBest
-                        ? QStringLiteral("Finish saved — New PB: ")
-                              + formatIgt(process->gameTime)
-                        : QStringLiteral("Finish saved: ")
-                              + formatIgt(process->gameTime);
+                && !gameTimeRewound
+                && process->healthAvailable
+                && process->laraHealth > 0.0f
+                && (!process->loadingAvailable || !process->loading)) {
+                if (!integrityPassed) {
+                    finishMessage = QStringLiteral("Finish rejected: ")
+                        + process->blockedModule;
                 } else {
-                    finishMessage = QStringLiteral("Finish not saved: ")
-                        + saveError;
+                    QString saveError;
+
+                    if (saveCompletedAttempt(
+                            levelSelector->currentText(),
+                            categorySelector->currentText(),
+                            subcategorySelector->currentText(),
+                            process->gameTime,
+                            process->buildHash,
+                            &saveError)) {
+                        finishMessage = QStringLiteral("Finish saved: ")
+                            + formatIgt(process->gameTime);
+                    } else {
+                        finishMessage = QStringLiteral("Finish not saved: ")
+                            + saveError;
+                    }
                 }
 
+                // Consume this completion even when integrity fails: a persistent
+                // portal code must never be accepted after a Menu Hook is removed.
                 finishArmed = false;
+                finishHandled = true;
             }
+            previousLevelCount =
+                process->levelCountAvailable && std::isfinite(process->levelCount)
+                    ? process->levelCount
+                    : -1.0f;
 
             const QString integrityStatus =
                 integrityPassed
@@ -1829,7 +1129,7 @@ int main(int argc, char *argv[])
             status->setText(
                 QStringLiteral(
                     "Selected speedrun:\n%1\n%2\n%3"
-                    "\n\n%4\n\nIGT\n%5\n\nPB IGT\n%6\n\n%7"
+                    "\n\n%4\n\nIGT\n%5\n\n%6"
                     )
                     .arg(
                         levelSelector->currentText(),
@@ -1837,7 +1137,6 @@ int main(int argc, char *argv[])
                         levelVerificationStatus,
                         activityStatus,
                         gameTimeStatus,
-                        bestIgtStatus,
                         integrityStatus
                         )
                 );

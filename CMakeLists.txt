@@ -11,6 +11,10 @@ qt_standard_project_setup()
 
 qt_add_executable(TRASR
     main.cpp
+    tra_process.cpp
+    run_rules.cpp
+    tra_process.h
+    run_rules.h
 )
 
 target_link_libraries(TRASR PRIVATE Qt6::Widgets Qt6::Network)
