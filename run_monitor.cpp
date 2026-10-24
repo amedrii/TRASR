@@ -17,6 +17,18 @@ static bool saveCompletedAttempt(
         );
 }
 
+std::optional<AttemptRecord> RunMonitor::takeSavedAttempt()
+{
+    std::optional<AttemptRecord> attempt = m_savedAttempt;
+    m_savedAttempt.reset();
+    return attempt;
+}
+
+RunPresence RunMonitor::presence() const
+{
+    return m_presence;
+}
+
 QString RunMonitor::update(const RunSelection &selection)
 {
             const auto process = findTraProcess();
@@ -29,9 +41,9 @@ QString RunMonitor::update(const RunSelection &selection)
                 m_finishArmed = false;
                 m_finishHandled = false;
                 m_finishMessage.clear();
+                m_presence = RunPresence{QStringLiteral("waiting"), -1.0f};
 
-                return QStringLiteral("Tomb Raider: Anniversary\nnot running")
-                    ;
+                return QStringLiteral("Tomb Raider: Anniversary\nnot running");
             }
 
             const QString gameTimeStatus =
@@ -110,6 +122,9 @@ QString RunMonitor::update(const RunSelection &selection)
                 m_finishHandled = false;
                 m_finishMessage.clear();
                 m_previousLevelCount = -1.0f;
+                // Keep the restart state visible long enough for the opponent
+                // heartbeat to report it at least once.
+                m_restartPresencePolls = 50;
             }
 
             const bool levelCountAdvanced =
@@ -178,6 +193,13 @@ QString RunMonitor::update(const RunSelection &selection)
             const bool onEndTrigger =
                 onEndPortal || onEndSignal || onEndscreenCompletion;
 
+            // Signal IDs are reused by unrelated trigger meshes. They may
+            // assist diagnostics, but never authorise a finish. The optional
+            // screen verifier independently identifies the actual result
+            // screen and writes one matching completion event.
+            const bool screenCompletionConfirmed =
+                m_screenCompletionReader.takeCompletionFor(selection.level);
+
             // Loading a save can also move game state forward. Never carry an
             // armed attempt across that transition; it must be observed again
             // from stable in-level state.
@@ -194,8 +216,6 @@ QString RunMonitor::update(const RunSelection &selection)
                 && process->gameTimeAvailable
                 && process->gameTime > 0.0f
                 && !gameTimeRewound
-                && process->healthAvailable
-                && process->laraHealth > 0.0f
                 && (!process->loadingAvailable || !process->loading)
                 && !onEndTrigger) {
                 m_finishArmed = true;
@@ -204,12 +224,10 @@ QString RunMonitor::update(const RunSelection &selection)
 
             if (!m_finishHandled
                 && m_finishArmed
-                && onEndTrigger
+                && screenCompletionConfirmed
                 && process->gameTimeAvailable
                 && process->gameTime > 0.0f
                 && !gameTimeRewound
-                && process->healthAvailable
-                && process->laraHealth > 0.0f
                 && (!process->loadingAvailable || !process->loading)) {
                 if (!integrityPassed) {
                     m_finishMessage = QStringLiteral("Finish rejected: ")
@@ -224,6 +242,13 @@ QString RunMonitor::update(const RunSelection &selection)
                             process->gameTime,
                             process->buildHash,
                             &saveError)) {
+                        m_savedAttempt = AttemptRecord{
+                            selection.level,
+                            selection.category,
+                            selection.subcategory,
+                            process->gameTime,
+                            process->buildHash
+                        };
                         m_finishMessage = QStringLiteral("Finish saved: ")
                             + formatIgt(process->gameTime);
                     } else {
@@ -241,6 +266,18 @@ QString RunMonitor::update(const RunSelection &selection)
                 process->levelCountAvailable && std::isfinite(process->levelCount)
                     ? process->levelCount
                     : -1.0f;
+
+            if (m_finishHandled) {
+                m_presence = RunPresence{QStringLiteral("finished"), process->gameTime};
+            } else if (m_restartPresencePolls > 0) {
+                --m_restartPresencePolls;
+                m_presence = RunPresence{QStringLiteral("restarted"), process->gameTime};
+            } else if (m_levelVerifiedThisRun && process->gameTimeAvailable
+                       && process->gameTime > 0.0f) {
+                m_presence = RunPresence{QStringLiteral("running"), process->gameTime};
+            } else {
+                m_presence = RunPresence{QStringLiteral("waiting"), process->gameTime};
+            }
 
             const QString integrityStatus =
                 integrityPassed

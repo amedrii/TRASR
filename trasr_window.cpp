@@ -3,21 +3,30 @@
 #include "tra_process.h"
 #include "run_rules.h"
 #include "run_monitor.h"
+#include "screen_completion.h"
 #include "trasr_window.h"
 #include <QComboBox>
 #include <QFont>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QJsonValue>
 #include <QDialog>
+#include <QDir>
+#include <QFileInfo>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMainWindow>
+#include <QMessageBox>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QPushButton>
+#include <QProcess>
 #include <QSettings>
 #include <QStringList>
+
+#include <memory>
 #include <QTimer>
 #include <QUuid>
 #include <QUrl>
@@ -180,6 +189,32 @@ int runTrasrApplication(QApplication &app)
         );
     serverStatus->setAlignment(Qt::AlignCenter);
 
+    auto *screenVerifierStatus = new QLabel(
+        QStringLiteral("Screen verifier: starting after login")
+        );
+    screenVerifierStatus->setAlignment(Qt::AlignCenter);
+
+    auto *opponentStatus = new QLabel(
+        QStringLiteral("Opponent: waiting for match")
+        );
+    opponentStatus->setAlignment(Qt::AlignCenter);
+
+    auto *readyButton = new QPushButton(
+        QStringLiteral("Ready for automatic start")
+        );
+    readyButton->setEnabled(false);
+
+    auto *autoStartStatus = new QLabel(
+        QStringLiteral("Automatic start: join a match first")
+        );
+    autoStartStatus->setAlignment(Qt::AlignCenter);
+    autoStartStatus->setWordWrap(true);
+
+    auto *forfeitButton = new QPushButton(
+        QStringLiteral("Forfeit match")
+        );
+    forfeitButton->setEnabled(false);
+
     // UI only for now; queue joining is the next matchmaking step.
     auto *randomQueueButton = new QPushButton(
         QStringLiteral("Join random queue")
@@ -197,6 +232,21 @@ int runTrasrApplication(QApplication &app)
         QStringLiteral("Matchmaking: not queued")
         );
     queueStatus->setAlignment(Qt::AlignCenter);
+
+    auto setQueueUiState = [randomQueueButton, rulesetQueueButton,
+                             cancelQueueButton, levelSelector,
+                             categorySelector, subcategorySelector](
+        bool canJoin, bool canCancel, bool canChangeRuleset
+        ) {
+            randomQueueButton->setEnabled(canJoin);
+            rulesetQueueButton->setEnabled(canJoin);
+            cancelQueueButton->setEnabled(canCancel);
+            levelSelector->setEnabled(canChangeRuleset);
+            categorySelector->setEnabled(canChangeRuleset);
+            subcategorySelector->setEnabled(canChangeRuleset);
+        };
+
+    setQueueUiState(true, false, true);
 
     QFont statusFont;
     statusFont.setPointSize(16);
@@ -232,6 +282,11 @@ int runTrasrApplication(QApplication &app)
     layout->addWidget(subcategoryLabel);
     layout->addWidget(subcategorySelector);
     layout->addWidget(serverStatus);
+    layout->addWidget(screenVerifierStatus);
+    layout->addWidget(opponentStatus);
+    layout->addWidget(readyButton);
+    layout->addWidget(autoStartStatus);
+    layout->addWidget(forfeitButton);
     layout->addWidget(randomQueueButton);
     layout->addWidget(rulesetQueueButton);
     layout->addWidget(cancelQueueButton);
@@ -243,7 +298,172 @@ int runTrasrApplication(QApplication &app)
     // Local development health check for the Node matchmaking server.
     auto *networkManager = new QNetworkAccessManager(&window);
 
+    auto *screenDetector = new QProcess(&window);
+    screenDetector->setProcessChannelMode(QProcess::MergedChannels);
+
+    auto launchScreenDetector = [screenDetector, screenVerifierStatus]() {
+        const QString level = screenDetector->property("selectedLevel").toString();
+        const QString scriptPath = QDir(QCoreApplication::applicationDirPath())
+            .filePath(QStringLiteral("tools/level_end_detector.py"));
+
+        if (level.isEmpty() || !QFileInfo::exists(scriptPath)) {
+            screenVerifierStatus->setText(
+                QStringLiteral("Screen verifier: unavailable")
+                );
+            return;
+        }
+
+        QStringList arguments{
+            QStringLiteral("-3.13"),
+            scriptPath,
+            QStringLiteral("--level"), level,
+            QStringLiteral("--event-file"), screenCompletionEventPath()
+        };
+
+        const QString tesseractPath =
+            QStringLiteral("C:/Program Files/Tesseract-OCR/tesseract.exe");
+        if (QFileInfo::exists(tesseractPath)) {
+            arguments << QStringLiteral("--tesseract") << tesseractPath;
+        }
+
+        screenDetector->start(QStringLiteral("py"), arguments);
+        screenVerifierStatus->setText(
+            QStringLiteral("Screen verifier: watching %1").arg(level)
+            );
+    };
+
+    auto restartScreenDetector = [screenDetector, launchScreenDetector](
+        const QString &level
+        ) {
+            screenDetector->setProperty("selectedLevel", level);
+
+            if (screenDetector->state() == QProcess::NotRunning) {
+                launchScreenDetector();
+                return;
+            }
+
+            screenDetector->setProperty("restartWhenStopped", true);
+            screenDetector->terminate();
+        };
+
+    QObject::connect(
+        screenDetector,
+        qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
+        &window,
+        [screenDetector, screenVerifierStatus, launchScreenDetector](
+            int, QProcess::ExitStatus
+            ) {
+                if (!screenDetector->property("restartWhenStopped").toBool()) {
+                    screenVerifierStatus->setText(
+                        QStringLiteral("Screen verifier: stopped")
+                        );
+                    return;
+                }
+
+                screenDetector->setProperty("restartWhenStopped", false);
+                QTimer::singleShot(50, screenDetector, launchScreenDetector);
+            }
+        );
+
+    QObject::connect(
+        screenDetector,
+        &QProcess::errorOccurred,
+        &window,
+        [screenVerifierStatus](QProcess::ProcessError) {
+            screenVerifierStatus->setText(
+                QStringLiteral("Screen verifier: unavailable")
+                );
+        }
+        );
+
+    auto submitOnlineResult = [networkManager, queueStatus, playerId](
+        const AttemptRecord &attempt
+        ) {
+            QSettings settings;
+            const QString sessionToken = settings.value(
+                QStringLiteral("matchmaking/sessionToken")
+                ).toString();
+
+            if (sessionToken.isEmpty()) {
+                queueStatus->setText(
+                    QStringLiteral("Finish saved locally: login required for submission")
+                    );
+                return;
+            }
+
+            const QJsonObject body{
+                {QStringLiteral("sessionToken"), sessionToken},
+                {QStringLiteral("level"), attempt.level},
+                {QStringLiteral("category"), attempt.category},
+                {QStringLiteral("subcategory"), attempt.subcategory},
+                {QStringLiteral("igtMilliseconds"),
+                 static_cast<double>(std::round(attempt.igtSeconds * 1000.0f))},
+                {QStringLiteral("buildHash"), attempt.buildHash}
+            };
+
+            QNetworkRequest request(
+                QUrl(QStringLiteral("https://api.trsr.app/matches/")
+                    + playerId + QStringLiteral("/result"))
+                );
+            request.setHeader(
+                QNetworkRequest::ContentTypeHeader,
+                QStringLiteral("application/json")
+                );
+
+            auto *reply = networkManager->post(
+                request,
+                QJsonDocument(body).toJson(QJsonDocument::Compact)
+                );
+
+            QObject::connect(
+                reply,
+                &QNetworkReply::finished,
+                [reply, queueStatus, playerId]() {
+                    const QJsonObject response =
+                        QJsonDocument::fromJson(reply->readAll()).object();
+
+                    if (reply->error() != QNetworkReply::NoError) {
+                        const QString error =
+                            response.value(QStringLiteral("error")).toString();
+                        queueStatus->setText(
+                            error.isEmpty()
+                                ? QStringLiteral("Finish saved locally: online submission failed")
+                                : QStringLiteral("Finish saved locally: %1").arg(error)
+                            );
+                    } else {
+                        const QString winnerPlayerId =
+                            response.value(QStringLiteral("winnerPlayerId")).toString();
+                        if (!winnerPlayerId.isEmpty()) {
+                            queueStatus->setText(
+                                winnerPlayerId == playerId
+                                    ? QStringLiteral("Finish submitted — You win!")
+                                    : QStringLiteral("Finish submitted — Opponent wins")
+                                );
+                        } else {
+                            queueStatus->setText(
+                                response.value(QStringLiteral("status")).toString()
+                                    == QStringLiteral("already_submitted")
+                                    ? QStringLiteral("Finish was already submitted")
+                                    : QStringLiteral("Finish submitted")
+                                );
+                        }
+                    }
+
+                    reply->deleteLater();
+                }
+                );
+        };
     auto *matchPollTimer = new QTimer(&window);
+    auto *matchPresenceTimer = new QTimer(&window);
+    matchPresenceTimer->setInterval(2000);
+    auto hasActiveMatch = std::make_shared<bool>(false);
+    auto latestPresence = std::make_shared<RunPresence>();
+    auto autoStartPresence = std::make_shared<QString>();
+    auto autoStartNavigationScheduled = std::make_shared<bool>(false);
+    auto autoStartLaunchScheduled = std::make_shared<bool>(false);
+    auto autoStartAwaitingRun = std::make_shared<bool>(false);
+    auto *menuNavigator = new QProcess(&window);
+    menuNavigator->setProcessChannelMode(QProcess::SeparateChannels);
     matchPollTimer->setInterval(1000);
 
     auto *healthReply = networkManager->get(
@@ -456,384 +676,574 @@ int runTrasrApplication(QApplication &app)
         }
         );
 
+    auto navigatorOutput = std::make_shared<QByteArray>();
     QObject::connect(
-        matchPollTimer,
+        menuNavigator,
+        &QProcess::readyReadStandardOutput,
+        &window,
+        [menuNavigator, navigatorOutput, autoStartPresence, autoStartStatus,
+         readyButton, autoStartLaunchScheduled]() {
+            *navigatorOutput += menuNavigator->readAllStandardOutput();
+            while (true) {
+                const int newline = navigatorOutput->indexOf('\n');
+                if (newline < 0) {
+                    break;
+                }
+                const QByteArray line = navigatorOutput->left(newline);
+                navigatorOutput->remove(0, newline + 1);
+                const QJsonObject event = QJsonDocument::fromJson(line).object();
+                const QString name = event.value(QStringLiteral("event")).toString();
+                if (name == QStringLiteral("menu_armed")) {
+                    *autoStartPresence = QStringLiteral("armed");
+                    *autoStartLaunchScheduled = false;
+                    autoStartStatus->setText(
+                        QStringLiteral("Automatic start: Final Conflict armed; waiting for opponent")
+                        );
+                } else if (name == QStringLiteral("menu_waiting_for_launch")) {
+                    autoStartStatus->setText(
+                        QStringLiteral("Automatic start: waiting for shared GO")
+                        );
+                } else if (name == QStringLiteral("menu_launch_sent")) {
+                    autoStartPresence->clear();
+                    autoStartStatus->setText(
+                        QStringLiteral("Automatic start: launched; verifying IGT")
+                        );
+                } else if (name == QStringLiteral("menu_navigation_failed")) {
+                    autoStartPresence->clear();
+                    *autoStartLaunchScheduled = false;
+                    readyButton->setEnabled(true);
+                    autoStartStatus->setText(
+                        QStringLiteral("Automatic start stopped: %1")
+                            .arg(event.value(QStringLiteral("error")).toString())
+                        );
+                }
+            }
+        }
+        );
+
+    QObject::connect(
+        menuNavigator,
+        qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
+        &window,
+        [autoStartPresence, autoStartStatus, readyButton]() {
+            if (*autoStartPresence == QStringLiteral("arming")) {
+                autoStartPresence->clear();
+                readyButton->setEnabled(true);
+                autoStartStatus->setText(
+                    QStringLiteral("Automatic start stopped before arming")
+                    );
+            }
+        }
+        );
+
+    QObject::connect(
+        readyButton,
+        &QPushButton::clicked,
+        &window,
+        [menuNavigator, hasActiveMatch, levelSelector, autoStartPresence,
+         autoStartNavigationScheduled, autoStartLaunchScheduled, autoStartStatus, readyButton]() {
+            if (!*hasActiveMatch || menuNavigator->state() != QProcess::NotRunning) {
+                return;
+            }
+            if (levelSelector->currentText() != QStringLiteral("Final Conflict")) {
+                autoStartStatus->setText(
+                    QStringLiteral("Automatic start currently supports Final Conflict only")
+                    );
+                return;
+            }
+            *autoStartPresence = QStringLiteral("ready");
+            *autoStartNavigationScheduled = false;
+            *autoStartLaunchScheduled = false;
+            readyButton->setEnabled(false);
+            autoStartStatus->setText(
+                QStringLiteral("Ready: waiting for opponent. Keep Tomb Raider on Play Game.")
+                );
+        }
+        );
+    QObject::connect(
+        forfeitButton,
+        &QPushButton::clicked,
+        &window,
+        [networkManager, playerId, hasActiveMatch, autoStartPresence, menuNavigator,
+         forfeitButton, readyButton, queueStatus, matchPresenceTimer, setQueueUiState, &window]() {
+            if (!*hasActiveMatch) {
+                return;
+            }
+            if (QMessageBox::question(
+                    &window,
+                    QStringLiteral("Forfeit match?"),
+                    QStringLiteral("This immediately awards the match to your opponent."),
+                    QMessageBox::Yes | QMessageBox::No,
+                    QMessageBox::No
+                    ) != QMessageBox::Yes) {
+                return;
+            }
+            QSettings settings;
+            const QString sessionToken = settings.value(
+                QStringLiteral("matchmaking/sessionToken")).toString();
+            if (sessionToken.isEmpty()) {
+                queueStatus->setText(QStringLiteral("Forfeit failed: login required"));
+                return;
+            }
+            forfeitButton->setEnabled(false);
+            const QJsonObject body{{QStringLiteral("sessionToken"), sessionToken}};
+            QNetworkRequest request(
+                QUrl(QStringLiteral("https://api.trsr.app/matches/")
+                    + playerId + QStringLiteral("/forfeit"))
+                );
+            request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+            auto *reply = networkManager->post(
+                request, QJsonDocument(body).toJson(QJsonDocument::Compact));
+            QObject::connect(
+                reply, &QNetworkReply::finished,
+                [reply, hasActiveMatch, autoStartPresence, menuNavigator, forfeitButton,
+                 readyButton, queueStatus, matchPresenceTimer, setQueueUiState]() {
+                    const QJsonObject response =
+                        QJsonDocument::fromJson(reply->readAll()).object();
+                    if (reply->error() != QNetworkReply::NoError) {
+                        queueStatus->setText(QStringLiteral("Forfeit failed: server request failed"));
+                        forfeitButton->setEnabled(true);
+                        reply->deleteLater();
+                        return;
+                    }
+                    *hasActiveMatch = false;
+                    autoStartPresence->clear();
+                    if (menuNavigator->state() != QProcess::NotRunning) {
+                        menuNavigator->terminate();
+                    }
+                    matchPresenceTimer->stop();
+                    readyButton->setEnabled(false);
+                    forfeitButton->setEnabled(false);
+                    setQueueUiState(true, false, true);
+                    queueStatus->setText(
+                        response.value(QStringLiteral("status")).toString() == QStringLiteral("forfeited")
+                            ? QStringLiteral("Match forfeited — opponent wins")
+                            : QStringLiteral("Match was already decided")
+                        );
+                    reply->deleteLater();
+                }
+                );
+        }
+        );
+
+    QObject::connect(
+        matchPresenceTimer,
         &QTimer::timeout,
         &window,
-        [networkManager, matchPollTimer, randomQueueButton, rulesetQueueButton, queueStatus,
-         levelSelector, categorySelector, subcategorySelector, playerId]() {
-            auto *reply = networkManager->get(
-                QNetworkRequest(
-                    QUrl(
-                        QStringLiteral("https://api.trsr.app/matches/")
-                        + playerId
-                        )
-                    )
+        [networkManager, playerId, opponentStatus, readyButton, forfeitButton, autoStartStatus, menuNavigator, hasActiveMatch, latestPresence, autoStartPresence, autoStartNavigationScheduled, autoStartLaunchScheduled, autoStartAwaitingRun]() {
+            if (!*hasActiveMatch) {
+                return;
+            }
+            readyButton->setEnabled(autoStartPresence->isEmpty()
+                                    && menuNavigator->state() == QProcess::NotRunning);
+            forfeitButton->setEnabled(true);
+
+            QSettings settings;
+            const QString sessionToken = settings.value(
+                QStringLiteral("matchmaking/sessionToken")).toString();
+            if (sessionToken.isEmpty()) {
+                return;
+            }
+
+            const QJsonObject body{
+                {QStringLiteral("sessionToken"), sessionToken},
+                {QStringLiteral("state"), autoStartPresence->isEmpty() ? latestPresence->state : *autoStartPresence},
+                {QStringLiteral("igtMilliseconds"),
+                 latestPresence->igtSeconds < 0.0f
+                     ? QJsonValue()
+                     : QJsonValue(static_cast<double>(std::round(
+                           latestPresence->igtSeconds * 1000.0f)))}
+            };
+            QNetworkRequest request(
+                QUrl(QStringLiteral("https://api.trsr.app/matches/")
+                    + playerId + QStringLiteral("/presence"))
                 );
+            request.setHeader(QNetworkRequest::ContentTypeHeader,
+                              QStringLiteral("application/json"));
+            auto *reply = networkManager->post(
+                request, QJsonDocument(body).toJson(QJsonDocument::Compact));
 
             QObject::connect(
                 reply,
                 &QNetworkReply::finished,
-                [reply, matchPollTimer, randomQueueButton, rulesetQueueButton,
-                 queueStatus, levelSelector, categorySelector, subcategorySelector]() {
+                [reply, playerId, opponentStatus, autoStartStatus, menuNavigator, autoStartPresence, autoStartNavigationScheduled, autoStartLaunchScheduled, latestPresence, autoStartAwaitingRun]() {
                     if (reply->error() != QNetworkReply::NoError) {
+                        opponentStatus->setText(
+                            QStringLiteral("Opponent: status unavailable"));
                         reply->deleteLater();
                         return;
                     }
 
                     const QJsonObject response =
                         QJsonDocument::fromJson(reply->readAll()).object();
-
-                    if (response.value(
-                                    QStringLiteral("status")
-                                    ).toString() != QStringLiteral("matched")) {
-                        reply->deleteLater();
-                        return;
-                    }
-
-                    const QJsonObject match =
-                        response.value(QStringLiteral("match")).toObject();
-
-                    levelSelector->setCurrentText(
-                        match.value(QStringLiteral("level")).toString()
-                        );
-
-                    categorySelector->setCurrentText(
-                        match.value(QStringLiteral("category")).toString()
-                        );
-
-                    subcategorySelector->setCurrentText(
-                        match.value(QStringLiteral("subcategory")).toString()
-                        );
-
-                    queueStatus->setText(
-                        QStringLiteral("Match found: %1 — %2 — %3")
-                            .arg(match.value(
-                                          QStringLiteral("level")
-                                          ).toString())
-                            .arg(match.value(
-                                          QStringLiteral("category")
-                                          ).toString())
-                            .arg(match.value(
-                                          QStringLiteral("subcategory")
-                                          ).toString())
-                        );
-
-                    matchPollTimer->stop();
-                    randomQueueButton->setEnabled(false);
-                    rulesetQueueButton->setEnabled(false);
-                    reply->deleteLater();
-                }
-                );
-        }
-        );
-
-    QObject::connect(
-        cancelQueueButton,
-        &QPushButton::clicked,
-        &window,
-        [networkManager, randomQueueButton, rulesetQueueButton,
-         queueStatus, playerId]() {
-            QSettings settings;
-            const QString sessionToken =
-                settings.value(QStringLiteral("matchmaking/sessionToken")).toString();
-
-            if (sessionToken.isEmpty()) {
-                queueStatus->setText(
-                    QStringLiteral("Matchmaking: link Speedrun.com first")
-                    );
-                return;
-            }
-
-            QJsonObject requestBody{
-                {QStringLiteral("playerId"), playerId},
-                {QStringLiteral("sessionToken"), sessionToken}
-            };
-
-            QNetworkRequest request(
-                QUrl(QStringLiteral("https://api.trsr.app/queue/cancel"))
-                );
-            request.setHeader(
-                QNetworkRequest::ContentTypeHeader,
-                QStringLiteral("application/json")
-                );
-
-            auto *reply = networkManager->post(
-                request,
-                QJsonDocument(requestBody).toJson(QJsonDocument::Compact)
-                );
-
-            QObject::connect(
-                reply,
-                &QNetworkReply::finished,
-                [reply, randomQueueButton, rulesetQueueButton, queueStatus]() {
-                    if (reply->error() != QNetworkReply::NoError) {
-                        queueStatus->setText(
-                            QStringLiteral("Matchmaking: could not cancel queue")
+                    const QString winnerPlayerId =
+                        response.value(QStringLiteral("winnerPlayerId")).toString();
+                    if (!winnerPlayerId.isEmpty()) {
+                        opponentStatus->setText(
+                            winnerPlayerId == playerId
+                                ? QStringLiteral("Result: You win")
+                                : QStringLiteral("Result: Opponent wins")
                             );
                         reply->deleteLater();
                         return;
                     }
+                    const QJsonArray players =
+                        response.value(QStringLiteral("players")).toArray();
+                    QString opponentState;
+                    QJsonObject opponent;
+                    for (const QJsonValue &player : players) {
+                        const QJsonObject candidate = player.toObject();
+                        if (candidate.value(QStringLiteral("playerId")).toString()
+                            != playerId) {
+                            opponent = candidate;
+                            break;
+                        }
+                    }
 
-                    queueStatus->setText(
-                        QStringLiteral("Matchmaking: queue cancelled")
-                        );
-                    randomQueueButton->setEnabled(true);
-                    rulesetQueueButton->setEnabled(true);
+                    if (opponent.isEmpty()) {
+                        opponentStatus->setText(
+                            QStringLiteral("Opponent: waiting for opponent"));
+                    } else {
+                        const QString state =
+                            opponent.value(QStringLiteral("state")).toString();
+                        opponentState = state;
+                        const double milliseconds =
+                            opponent.value(QStringLiteral("igtMilliseconds")).toDouble(-1.0);
+                        QString detail;
+                        if (state == QStringLiteral("ready")) {
+                            detail = QStringLiteral("Ready");
+                        } else if (state == QStringLiteral("arming")) {
+                            detail = QStringLiteral("Navigating menus");
+                        } else if (state == QStringLiteral("armed")) {
+                            detail = QStringLiteral("Armed");
+                        } else if (state == QStringLiteral("running")) {
+                            detail = QStringLiteral("Running");
+                        } else if (state == QStringLiteral("restarted")) {
+                            detail = QStringLiteral("Restarted");
+                        } else if (state == QStringLiteral("finished")) {
+                            detail = QStringLiteral("Finished");
+                        } else {
+                            detail = QStringLiteral("Waiting to start");
+                        }
+                        if (milliseconds >= 0.0) {
+                            detail += QStringLiteral(" — ")
+                                + formatIgt(static_cast<float>(milliseconds / 1000.0));
+                        }
+                        opponentStatus->setText(
+                            QStringLiteral("Opponent: %1").arg(detail));
+                    }
+                    if (*autoStartPresence == QStringLiteral("armed")
+                        && opponentState == QStringLiteral("waiting")) {
+                        menuNavigator->terminate();
+                        autoStartPresence->clear();
+                        *autoStartLaunchScheduled = false;
+                        autoStartStatus->setText(
+                            QStringLiteral("Run start cancelled: opponent did not finish preparing")
+                            );
+                    }
+
+                    if (*autoStartPresence == QStringLiteral("ready")
+                        && !*autoStartNavigationScheduled) {
+                        const int delayMilliseconds = response.value(
+                            QStringLiteral("navigationDelayMilliseconds")
+                            ).toInt(-1);
+                        if (delayMilliseconds >= 0) {
+                            *autoStartNavigationScheduled = true;
+                            autoStartStatus->setText(
+                                QStringLiteral("Both players ready — focus Tomb Raider / Play Game in %1 seconds")
+                                    .arg((delayMilliseconds + 999) / 1000)
+                                );
+                            QTimer::singleShot(
+                                delayMilliseconds,
+                                menuNavigator,
+                                [menuNavigator, autoStartPresence, autoStartStatus]() {
+                                    if (menuNavigator->state() != QProcess::NotRunning) {
+                                        return;
+                                    }
+                                    const QString scriptPath = QDir(QCoreApplication::applicationDirPath())
+                                        .filePath(QStringLiteral("tools/menu_navigator.py"));
+                                    if (!QFileInfo::exists(scriptPath)) {
+                                        autoStartPresence->clear();
+                                        autoStartStatus->setText(
+                                            QStringLiteral("Run failed to start: navigator file is missing")
+                                            );
+                                        return;
+                                    }
+                                    *autoStartPresence = QStringLiteral("arming");
+                                    autoStartStatus->setText(
+                                        QStringLiteral("Automatic start: verifying focus and navigating menus…")
+                                        );
+                                    QStringList arguments{
+                                        QStringLiteral("-3.13"), scriptPath,
+                                        QStringLiteral("--level"), QStringLiteral("Final Conflict"),
+                                        QStringLiteral("--wait-for-launch")
+                                    };
+                                    const QString tesseractPath =
+                                        QStringLiteral("C:/Program Files/Tesseract-OCR/tesseract.exe");
+                                    if (QFileInfo::exists(tesseractPath)) {
+                                        arguments << QStringLiteral("--tesseract") << tesseractPath;
+                                    }
+                                    menuNavigator->start(QStringLiteral("py"), arguments);
+                                }
+                                );
+                        }
+                    }
+
+                    if (*autoStartPresence == QStringLiteral("armed")
+                        && !*autoStartLaunchScheduled) {
+                        const int delayMilliseconds = response.value(
+                            QStringLiteral("startDelayMilliseconds")
+                            ).toInt(-1);
+                        if (delayMilliseconds >= 0) {
+                            *autoStartLaunchScheduled = true;
+                            autoStartStatus->setText(
+                                QStringLiteral("Automatic start: both players armed — GO in %1 seconds")
+                                    .arg((delayMilliseconds + 999) / 1000)
+                                );
+                            QTimer::singleShot(
+                                delayMilliseconds,
+                                menuNavigator,
+                                [menuNavigator, autoStartStatus, latestPresence, autoStartAwaitingRun]() {
+                                    if (menuNavigator->state() != QProcess::NotRunning) {
+                                        autoStartStatus->setText(
+                                            QStringLiteral("Automatic start: GO!")
+                                            );
+                                        menuNavigator->write("{\"command\":\"launch\"}\n");
+                                        *autoStartAwaitingRun = true;
+                                        QTimer::singleShot(
+                                            20000,
+                                            menuNavigator,
+                                            [autoStartStatus, latestPresence, autoStartAwaitingRun]() {
+                                                if (!*autoStartAwaitingRun) {
+                                                    return;
+                                                }
+                                                *autoStartAwaitingRun = false;
+                                                if (latestPresence->state == QStringLiteral("running")) {
+                                                    autoStartStatus->setText(
+                                                        QStringLiteral("Automatic start: run started")
+                                                        );
+                                                } else {
+                                                    autoStartStatus->setText(
+                                                        QStringLiteral("Run failed to start: assigned level did not load")
+                                                        );
+                                                }
+                                            }
+                                            );
+                                    }
+                                }
+                                );
+                        }
+                    }
                     reply->deleteLater();
                 }
                 );
         }
         );
+    QObject::connect(
+        matchPollTimer,
+        &QTimer::timeout,
+        &window,
+        [networkManager, matchPollTimer, matchPresenceTimer, queueStatus, setQueueUiState,
+         levelSelector, categorySelector, subcategorySelector, playerId, hasActiveMatch]() {
+            auto *reply = networkManager->get(QNetworkRequest(QUrl(
+                QStringLiteral("https://api.trsr.app/matches/") + playerId)));
+            QObject::connect(
+                reply, &QNetworkReply::finished,
+                [reply, matchPollTimer, matchPresenceTimer, queueStatus, setQueueUiState,
+                 levelSelector, categorySelector, subcategorySelector, hasActiveMatch]() {
+                    if (reply->error() != QNetworkReply::NoError) {
+                        reply->deleteLater();
+                        return;
+                    }
+                    const QJsonObject response =
+                        QJsonDocument::fromJson(reply->readAll()).object();
+                    if (response.value(QStringLiteral("status")).toString()
+                        != QStringLiteral("matched")) {
+                        reply->deleteLater();
+                        return;
+                    }
+                    const QJsonObject match =
+                        response.value(QStringLiteral("match")).toObject();
+                    levelSelector->setCurrentText(match.value(QStringLiteral("level")).toString());
+                    categorySelector->setCurrentText(match.value(QStringLiteral("category")).toString());
+                    subcategorySelector->setCurrentText(match.value(QStringLiteral("subcategory")).toString());
+                    queueStatus->setText(
+                        QStringLiteral("Match found: %1 — %2 — %3")
+                            .arg(match.value(QStringLiteral("level")).toString())
+                            .arg(match.value(QStringLiteral("category")).toString())
+                            .arg(match.value(QStringLiteral("subcategory")).toString()));
+                    matchPollTimer->stop();
+                    *hasActiveMatch = true;
+                    matchPresenceTimer->start();
+                    setQueueUiState(false, false, false);
+                    reply->deleteLater();
+                });
+        });
 
     QObject::connect(
-        randomQueueButton,
-        &QPushButton::clicked,
-        &window,
-        [networkManager, randomQueueButton, queueStatus,
-         levelSelector, categorySelector, subcategorySelector, matchPollTimer,
-         playerId]() {
+        cancelQueueButton, &QPushButton::clicked, &window,
+        [networkManager, matchPollTimer, queueStatus, setQueueUiState, playerId]() {
             QSettings settings;
-
-            const QString sessionToken =
-                settings.value(QStringLiteral("matchmaking/sessionToken")).toString();
-
+            const QString sessionToken = settings.value(
+                QStringLiteral("matchmaking/sessionToken")).toString();
             if (sessionToken.isEmpty()) {
-                queueStatus->setText(
-                    QStringLiteral("Matchmaking: link Speedrun.com first")
-                    );
+                queueStatus->setText(QStringLiteral("Matchmaking: link Speedrun.com first"));
                 return;
             }
+            setQueueUiState(false, false, false);
+            const QJsonObject requestBody{
+                {QStringLiteral("playerId"), playerId},
+                {QStringLiteral("sessionToken"), sessionToken}
+            };
+            QNetworkRequest request(QUrl(QStringLiteral("https://api.trsr.app/queue/cancel")));
+            request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+            auto *reply = networkManager->post(
+                request, QJsonDocument(requestBody).toJson(QJsonDocument::Compact));
+            QObject::connect(
+                reply, &QNetworkReply::finished,
+                [reply, matchPollTimer, queueStatus, setQueueUiState]() {
+                    if (reply->error() != QNetworkReply::NoError) {
+                        queueStatus->setText(QStringLiteral("Matchmaking: could not cancel queue"));
+                        setQueueUiState(false, true, false);
+                        reply->deleteLater();
+                        return;
+                    }
+                    matchPollTimer->stop();
+                    queueStatus->setText(QStringLiteral("Matchmaking: queue cancelled"));
+                    setQueueUiState(true, false, true);
+                    reply->deleteLater();
+                });
+        });
 
-            randomQueueButton->setEnabled(false);
-
-            queueStatus->setText(
-                QStringLiteral("Matchmaking: joining random queue...")
-                );
-
+    QObject::connect(
+        randomQueueButton, &QPushButton::clicked, &window,
+        [networkManager, queueStatus, setQueueUiState, levelSelector,
+         categorySelector, subcategorySelector, matchPollTimer, matchPresenceTimer,
+         playerId, hasActiveMatch]() {
+            QSettings settings;
+            const QString sessionToken = settings.value(
+                QStringLiteral("matchmaking/sessionToken")).toString();
+            if (sessionToken.isEmpty()) {
+                queueStatus->setText(QStringLiteral("Matchmaking: link Speedrun.com first"));
+                return;
+            }
+            setQueueUiState(false, false, false);
+            queueStatus->setText(QStringLiteral("Matchmaking: joining random queue..."));
             const QJsonObject requestBody{
                 {QStringLiteral("playerId"), playerId},
                 {QStringLiteral("sessionToken"), sessionToken},
                 {QStringLiteral("queueType"), QStringLiteral("random")}
             };
-
-            QNetworkRequest request(
-                QUrl(QStringLiteral("https://api.trsr.app/queue"))
-                );
-
-            request.setHeader(
-                QNetworkRequest::ContentTypeHeader,
-                QStringLiteral("application/json")
-                );
-
+            QNetworkRequest request(QUrl(QStringLiteral("https://api.trsr.app/queue")));
+            request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
             auto *reply = networkManager->post(
-                request,
-                QJsonDocument(requestBody).toJson(QJsonDocument::Compact)
-                );
-
+                request, QJsonDocument(requestBody).toJson(QJsonDocument::Compact));
             QObject::connect(
-                reply,
-                &QNetworkReply::finished,
-                [reply, randomQueueButton, queueStatus, matchPollTimer,
-                levelSelector, categorySelector, subcategorySelector]() {
+                reply, &QNetworkReply::finished,
+                [reply, queueStatus, setQueueUiState, levelSelector,
+                 categorySelector, subcategorySelector, matchPollTimer, matchPresenceTimer,
+                 hasActiveMatch]() {
                     if (reply->error() != QNetworkReply::NoError) {
-                        queueStatus->setText(
-                            QStringLiteral("Matchmaking: server request failed")
-                            );
-
-                        randomQueueButton->setEnabled(true);
+                        queueStatus->setText(QStringLiteral("Matchmaking: server request failed"));
+                        setQueueUiState(true, false, true);
                         reply->deleteLater();
                         return;
                     }
-
-                    const QJsonObject response =
-                        QJsonDocument::fromJson(reply->readAll()).object();
-
-                    const QString responseStatus =
-                        response.value(QStringLiteral("status")).toString();
-
+                    const QJsonObject response = QJsonDocument::fromJson(reply->readAll()).object();
+                    const QString responseStatus = response.value(QStringLiteral("status")).toString();
                     if (responseStatus == QStringLiteral("waiting")) {
-                        queueStatus->setText(
-                            QStringLiteral("Matchmaking: waiting for opponent")
-                            );
-
+                        queueStatus->setText(QStringLiteral("Matchmaking: waiting for opponent"));
+                        setQueueUiState(false, true, false);
                         matchPollTimer->start();
-
                     } else if (responseStatus == QStringLiteral("matched")) {
-                        const QJsonObject match =
-                            response.value(QStringLiteral("match")).toObject();
-
-                        levelSelector->setCurrentText(
-                            match.value(QStringLiteral("level")).toString()
-                            );
-
-                        categorySelector->setCurrentText(
-                            match.value(QStringLiteral("category")).toString()
-                            );
-
-                        subcategorySelector->setCurrentText(
-                            match.value(QStringLiteral("subcategory")).toString()
-                            );
-
+                        const QJsonObject match = response.value(QStringLiteral("match")).toObject();
+                        levelSelector->setCurrentText(match.value(QStringLiteral("level")).toString());
+                        categorySelector->setCurrentText(match.value(QStringLiteral("category")).toString());
+                        subcategorySelector->setCurrentText(match.value(QStringLiteral("subcategory")).toString());
                         queueStatus->setText(
                             QStringLiteral("Match found: %1 — %2 — %3")
-                                .arg(match.value(
-                                              QStringLiteral("level")
-                                              ).toString())
-                                .arg(match.value(
-                                              QStringLiteral("category")
-                                              ).toString())
-                                .arg(match.value(
-                                              QStringLiteral("subcategory")
-                                              ).toString())
-                            );
+                                .arg(match.value(QStringLiteral("level")).toString())
+                                .arg(match.value(QStringLiteral("category")).toString())
+                                .arg(match.value(QStringLiteral("subcategory")).toString()));
+                        matchPollTimer->stop();
+                        *hasActiveMatch = true;
+                        matchPresenceTimer->start();
+                        setQueueUiState(false, false, false);
                     } else {
-                        queueStatus->setText(
-                            QStringLiteral("Matchmaking: ")
-                            + response.value(
-                                          QStringLiteral("error")
-                                          ).toString()
-                            );
-
-                        randomQueueButton->setEnabled(true);
+                        queueStatus->setText(QStringLiteral("Matchmaking: ")
+                            + response.value(QStringLiteral("error")).toString());
+                        setQueueUiState(true, false, true);
                     }
-
                     reply->deleteLater();
-                }
-                );
-        }
-        );
+                });
+        });
 
     QObject::connect(
-        rulesetQueueButton,
-        &QPushButton::clicked,
-        &window,
-        [networkManager, randomQueueButton,
-         rulesetQueueButton, queueStatus, levelSelector,
-         categorySelector, subcategorySelector, matchPollTimer,
-         playerId]() {
+        rulesetQueueButton, &QPushButton::clicked, &window,
+        [networkManager, queueStatus, setQueueUiState, levelSelector,
+         categorySelector, subcategorySelector, matchPollTimer, matchPresenceTimer,
+         playerId, hasActiveMatch]() {
             QSettings settings;
-
-            const QString sessionToken =
-                settings.value(QStringLiteral("matchmaking/sessionToken")).toString();
-
+            const QString sessionToken = settings.value(
+                QStringLiteral("matchmaking/sessionToken")).toString();
             if (sessionToken.isEmpty()) {
-                queueStatus->setText(
-                    QStringLiteral("Matchmaking: link Speedrun.com first")
-                    );
+                queueStatus->setText(QStringLiteral("Matchmaking: link Speedrun.com first"));
                 return;
             }
-
-            randomQueueButton->setEnabled(false);
-            rulesetQueueButton->setEnabled(false);
-
+            setQueueUiState(false, false, false);
             queueStatus->setText(
-                QStringLiteral("Matchmaking: joining selected ruleset queue...")
-                );
-
+                QStringLiteral("Matchmaking: joining selected ruleset queue..."));
             const QJsonObject requestBody{
                 {QStringLiteral("playerId"), playerId},
                 {QStringLiteral("sessionToken"), sessionToken},
                 {QStringLiteral("queueType"), QStringLiteral("ruleset")},
                 {QStringLiteral("category"), categorySelector->currentText()},
-                {QStringLiteral(
-                     "subcategory"
-                     ), subcategorySelector->currentText()}
+                {QStringLiteral("subcategory"), subcategorySelector->currentText()}
             };
-
-            QNetworkRequest request(
-                QUrl(QStringLiteral("https://api.trsr.app/queue"))
-                );
-
-            request.setHeader(
-                QNetworkRequest::ContentTypeHeader,
-                QStringLiteral("application/json")
-                );
-
+            QNetworkRequest request(QUrl(QStringLiteral("https://api.trsr.app/queue")));
+            request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
             auto *reply = networkManager->post(
-                request,
-                QJsonDocument(requestBody).toJson(QJsonDocument::Compact)
-                );
-
+                request, QJsonDocument(requestBody).toJson(QJsonDocument::Compact));
             QObject::connect(
-                reply,
-                &QNetworkReply::finished,
-                [reply, randomQueueButton, rulesetQueueButton,
-                 queueStatus, levelSelector, categorySelector,
-                 subcategorySelector, matchPollTimer]() {
+                reply, &QNetworkReply::finished,
+                [reply, queueStatus, setQueueUiState, levelSelector,
+                 categorySelector, subcategorySelector, matchPollTimer, matchPresenceTimer,
+                 hasActiveMatch]() {
                     if (reply->error() != QNetworkReply::NoError) {
-                        queueStatus->setText(
-                            QStringLiteral("Matchmaking: server request failed")
-                            );
-
-                        randomQueueButton->setEnabled(true);
-                        rulesetQueueButton->setEnabled(true);
+                        queueStatus->setText(QStringLiteral("Matchmaking: server request failed"));
+                        setQueueUiState(true, false, true);
                         reply->deleteLater();
                         return;
                     }
-
-                    const QJsonObject response =
-                        QJsonDocument::fromJson(reply->readAll()).object();
-
-                    const QString responseStatus =
-                        response.value(QStringLiteral("status")).toString();
-
+                    const QJsonObject response = QJsonDocument::fromJson(reply->readAll()).object();
+                    const QString responseStatus = response.value(QStringLiteral("status")).toString();
                     if (responseStatus == QStringLiteral("waiting")) {
                         queueStatus->setText(
-                            QStringLiteral(
-                                "Matchmaking: waiting for ruleset opponent"
-                                )
-                            );
-
+                            QStringLiteral("Matchmaking: waiting for ruleset opponent"));
+                        setQueueUiState(false, true, false);
                         matchPollTimer->start();
                     } else if (responseStatus == QStringLiteral("matched")) {
-                        const QJsonObject match =
-                            response.value(QStringLiteral("match")).toObject();
-
-                        levelSelector->setCurrentText(
-                            match.value(QStringLiteral("level")).toString()
-                            );
-
-                        categorySelector->setCurrentText(
-                            match.value(QStringLiteral("category")).toString()
-                            );
-
-                        subcategorySelector->setCurrentText(
-                            match.value(QStringLiteral("subcategory")).toString()
-                            );
-
+                        const QJsonObject match = response.value(QStringLiteral("match")).toObject();
+                        levelSelector->setCurrentText(match.value(QStringLiteral("level")).toString());
+                        categorySelector->setCurrentText(match.value(QStringLiteral("category")).toString());
+                        subcategorySelector->setCurrentText(match.value(QStringLiteral("subcategory")).toString());
                         queueStatus->setText(
                             QStringLiteral("Match found: %1 — %2 — %3")
-                                .arg(match.value(
-                                              QStringLiteral("level")
-                                              ).toString())
-                                .arg(match.value(
-                                              QStringLiteral("category")
-                                              ).toString())
-                                .arg(match.value(
-                                              QStringLiteral("subcategory")
-                                              ).toString())
-                            );
-
+                                .arg(match.value(QStringLiteral("level")).toString())
+                                .arg(match.value(QStringLiteral("category")).toString())
+                                .arg(match.value(QStringLiteral("subcategory")).toString()));
                         matchPollTimer->stop();
+                        *hasActiveMatch = true;
+                        matchPresenceTimer->start();
+                        setQueueUiState(false, false, false);
                     } else {
-                        queueStatus->setText(
-                            QStringLiteral("Matchmaking: ")
-                            + response.value(
-                                          QStringLiteral("error")
-                                          ).toString()
-                            );
-
-                        randomQueueButton->setEnabled(true);
-                        rulesetQueueButton->setEnabled(true);
+                        queueStatus->setText(QStringLiteral("Matchmaking: ")
+                            + response.value(QStringLiteral("error")).toString());
+                        setQueueUiState(true, false, true);
                     }
-
                     reply->deleteLater();
-                }
-                );
-        }
-        );
-
+                });
+        });
     QObject::connect(
         levelSelector,
         &QComboBox::currentTextChanged,
@@ -863,9 +1273,10 @@ int runTrasrApplication(QApplication &app)
 
     // Poll ten times per second. IGT updates in whole seconds, but faster polling
     // helps distinguish normal play from pauses and loading transitions.
+    auto runMonitor = std::make_shared<RunMonitor>();
     auto updateStatus =
         [status, levelSelector, categorySelector, subcategorySelector,
-         runMonitor = RunMonitor()]() mutable {
+         submitOnlineResult, runMonitor, latestPresence]() {
             const RunSelection selection{
                 levelSelector->currentIndex(),
                 levelSelector->currentText(),
@@ -873,7 +1284,11 @@ int runTrasrApplication(QApplication &app)
                 subcategorySelector->currentText()
             };
 
-            status->setText(runMonitor.update(selection));
+            status->setText(runMonitor->update(selection));
+            *latestPresence = runMonitor->presence();
+            if (const auto savedAttempt = runMonitor->takeSavedAttempt()) {
+                submitOnlineResult(*savedAttempt);
+            }
         };
     QTimer timer;
     QObject::connect(&timer, &QTimer::timeout, &window, updateStatus);
@@ -884,10 +1299,18 @@ int runTrasrApplication(QApplication &app)
         return 0;
     }
 
+    QObject::connect(
+        levelSelector,
+        &QComboBox::currentTextChanged,
+        &window,
+        restartScreenDetector
+        );
+
+    restartScreenDetector(levelSelector->currentText());
     timer.start(100);
     updateStatus();
 
-    window.resize(440, 460);
+    window.resize(440, 480);
     window.show();
 
     return app.exec();

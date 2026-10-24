@@ -94,6 +94,258 @@ export default {
       return json({ status: "matched", match });
     }
 
+    if (request.method === "POST"
+        && url.pathname.startsWith("/matches/")
+        && url.pathname.endsWith("/presence")) {
+      const playerId = decodeURIComponent(
+        url.pathname.slice("/matches/".length, -"/presence".length)
+      );
+      const data = await body(request);
+      const session = await sessionFor(env, data?.sessionToken);
+      const state = typeof data?.state === "string" ? data.state : "";
+      const igtMilliseconds = data?.igtMilliseconds == null
+        ? null : Number(data.igtMilliseconds);
+      const allowedStates = new Set(["waiting", "ready", "arming", "armed", "running", "restarted", "finished"]);
+
+      if (!playerId) return json({ error: "A player is required." }, 400);
+      if (!session) return json({ error: "Link your Speedrun.com account before updating match status." }, 401);
+      if (!allowedStates.has(state)) return json({ error: "Invalid match status." }, 400);
+      if (igtMilliseconds != null
+          && (!Number.isInteger(igtMilliseconds) || igtMilliseconds < 0 || igtMilliseconds > 86400000)) {
+        return json({ error: "Invalid in-game time." }, 400);
+      }
+
+      const stored = await env.DB.prepare(`SELECT match_json FROM matches WHERE player_id = ?`)
+        .bind(playerId).first();
+      if (!stored) return json({ status: "none" });
+
+      const match = JSON.parse(stored.match_json);
+      const isParticipant = match.players?.some((player) =>
+        player.playerId === playerId && player.speedrunUserId === session.speedrun_user_id
+      );
+      if (!isParticipant) return json({ error: "This status does not belong to your active match." }, 403);
+
+      const now = new Date().toISOString();
+      await env.DB.prepare(
+        `INSERT INTO match_presence (match_id, player_id, state, igt_milliseconds, updated_at_utc)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(match_id, player_id) DO UPDATE SET
+           state = excluded.state,
+           igt_milliseconds = excluded.igt_milliseconds,
+           updated_at_utc = excluded.updated_at_utc`
+      ).bind(match.id, playerId, state, igtMilliseconds, now).run();
+
+      const rows = await env.DB.prepare(
+        `SELECT player_id, state, igt_milliseconds, updated_at_utc
+         FROM match_presence WHERE match_id = ?`
+      ).bind(match.id).all();
+      const presenceByPlayer = new Map(
+        (rows.results ?? []).map((row) => [row.player_id, row])
+      );
+      let navigationStartAtUtc = null;
+      const bothPlayersReady = match.players.length === 2 && match.players.every(
+        (player) => presenceByPlayer.get(player.playerId)?.state === "ready"
+      );
+      if (bothPlayersReady) {
+        await env.DB.prepare(
+          `INSERT OR IGNORE INTO match_navigation_schedule (match_id, start_at_utc, created_at_utc)
+           VALUES (?, ?, ?)`
+        ).bind(
+          match.id,
+          new Date(Date.now() + 5000).toISOString(),
+          now
+        ).run();
+        const schedule = await env.DB.prepare(
+          `SELECT start_at_utc FROM match_navigation_schedule WHERE match_id = ?`
+        ).bind(match.id).first();
+        navigationStartAtUtc = schedule?.start_at_utc ?? null;
+      } else {
+        await env.DB.prepare(
+          `DELETE FROM match_navigation_schedule WHERE match_id = ?`
+        ).bind(match.id).run();
+      }
+      const navigationDelayMilliseconds = navigationStartAtUtc
+        ? Math.max(0, Date.parse(navigationStartAtUtc) - Date.now())
+        : null;
+
+      let startAtUtc = null;
+      const bothPlayersArmed = match.players.length === 2 && match.players.every(
+        (player) => presenceByPlayer.get(player.playerId)?.state === "armed"
+      );
+      if (bothPlayersArmed) {
+        await env.DB.prepare(
+          `INSERT OR IGNORE INTO match_start_schedule (match_id, start_at_utc, created_at_utc)
+           VALUES (?, ?, ?)`
+        ).bind(
+          match.id,
+          new Date(Date.now() + 8000).toISOString(),
+          now
+        ).run();
+        const schedule = await env.DB.prepare(
+          `SELECT start_at_utc FROM match_start_schedule WHERE match_id = ?`
+        ).bind(match.id).first();
+        startAtUtc = schedule?.start_at_utc ?? null;
+      }
+      const startDelayMilliseconds = startAtUtc
+        ? Math.max(0, Date.parse(startAtUtc) - Date.now())
+        : null;
+      const outcome = await env.DB.prepare(
+        `SELECT winner_player_id, winner_igt_milliseconds, decided_at_utc
+         FROM match_outcomes WHERE match_id = ?`
+      ).bind(match.id).first();
+      return json({
+        status: "matched",
+        navigationStartAtUtc,
+        navigationDelayMilliseconds,
+        startAtUtc,
+        startDelayMilliseconds,
+        winnerPlayerId: outcome?.winner_player_id ?? null,
+        winnerIgtMilliseconds: outcome?.winner_igt_milliseconds ?? null,
+        decidedAtUtc: outcome?.decided_at_utc ?? null,
+        players: match.players.map((player) => {
+          const presence = presenceByPlayer.get(player.playerId);
+          return {
+            playerId: player.playerId,
+            state: presence?.state ?? "waiting",
+            igtMilliseconds: presence?.igt_milliseconds ?? null,
+            updatedAtUtc: presence?.updated_at_utc ?? null
+          };
+        })
+      });
+    }
+    if (request.method === "POST"
+        && url.pathname.startsWith("/matches/")
+        && url.pathname.endsWith("/forfeit")) {
+      const playerId = decodeURIComponent(
+        url.pathname.slice("/matches/".length, -"/forfeit".length)
+      );
+      const data = await body(request);
+      const session = await sessionFor(env, data?.sessionToken);
+      if (!playerId) return json({ error: "A player is required." }, 400);
+      if (!session) return json({ error: "Link your Speedrun.com account before forfeiting." }, 401);
+
+      const stored = await env.DB.prepare(`SELECT match_json FROM matches WHERE player_id = ?`)
+        .bind(playerId).first();
+      if (!stored) return json({ error: "No active match was found." }, 404);
+      const match = JSON.parse(stored.match_json);
+      const isParticipant = match.players?.some((player) =>
+        player.playerId === playerId && player.speedrunUserId === session.speedrun_user_id
+      );
+      if (!isParticipant) return json({ error: "This forfeit does not belong to your active match." }, 403);
+      const opponent = match.players?.find((player) => player.playerId !== playerId);
+      if (!opponent) return json({ error: "A two-player match is required to forfeit." }, 409);
+
+      const existingOutcome = await env.DB.prepare(
+        `SELECT winner_player_id, decided_at_utc FROM match_outcomes WHERE match_id = ?`
+      ).bind(match.id).first();
+      if (existingOutcome) {
+        return json({
+          status: "already_decided",
+          winnerPlayerId: existingOutcome.winner_player_id,
+          decidedAtUtc: existingOutcome.decided_at_utc
+        });
+      }
+
+      const now = new Date().toISOString();
+      await env.DB.batch([
+        env.DB.prepare(
+          `INSERT OR IGNORE INTO match_forfeits (match_id, player_id, forfeited_at_utc)
+           VALUES (?, ?, ?)`
+        ).bind(match.id, playerId, now),
+        env.DB.prepare(
+          `INSERT OR IGNORE INTO match_outcomes
+            (match_id, winner_player_id, winner_igt_milliseconds, decided_at_utc)
+           VALUES (?, ?, ?, ?)`
+        ).bind(match.id, opponent.playerId, 0, now)
+      ]);
+      const outcome = await env.DB.prepare(
+        `SELECT winner_player_id, winner_igt_milliseconds, decided_at_utc
+         FROM match_outcomes WHERE match_id = ?`
+      ).bind(match.id).first();
+      return json({
+        status: outcome.winner_player_id === opponent.playerId ? "forfeited" : "already_decided",
+        winnerPlayerId: outcome.winner_player_id,
+        decidedAtUtc: outcome.decided_at_utc
+      });
+    }
+    if (request.method === "POST"
+        && url.pathname.startsWith("/matches/")
+        && url.pathname.endsWith("/result")) {
+      const playerId = decodeURIComponent(
+        url.pathname.slice("/matches/".length, -"/result".length)
+      );
+      const data = await body(request);
+      const session = await sessionFor(env, data?.sessionToken);
+      const igtMilliseconds = Number(data?.igtMilliseconds);
+      const buildHash = typeof data?.buildHash === "string" ? data.buildHash : "";
+
+      if (!playerId) return json({ error: "A player is required." }, 400);
+      if (!session) return json({ error: "Link your Speedrun.com account before submitting a result." }, 401);
+      if (!Number.isInteger(igtMilliseconds) || igtMilliseconds <= 0 || igtMilliseconds > 86400000) {
+        return json({ error: "The submitted in-game time is invalid." }, 400);
+      }
+
+      const stored = await env.DB.prepare(`SELECT match_json FROM matches WHERE player_id = ?`)
+        .bind(playerId).first();
+      if (!stored) return json({ error: "No active match was found." }, 404);
+
+      const match = JSON.parse(stored.match_json);
+      const isParticipant = match.players?.some((player) =>
+        player.playerId === playerId && player.speedrunUserId === session.speedrun_user_id
+      );
+      if (!isParticipant) {
+        return json({ error: "This result does not belong to your active match." }, 403);
+      }
+      if (data?.level !== match.level
+          || data?.category !== match.category
+          || data?.subcategory !== match.subcategory) {
+        return json({ error: "This result does not match the active ruleset." }, 409);
+      }
+
+      const existingOutcome = await env.DB.prepare(
+        `SELECT winner_player_id, winner_igt_milliseconds, decided_at_utc
+         FROM match_outcomes WHERE match_id = ?`
+      ).bind(match.id).first();
+      if (existingOutcome) {
+        return json({
+          status: "already_decided",
+          winnerPlayerId: existingOutcome.winner_player_id,
+          winnerIgtMilliseconds: existingOutcome.winner_igt_milliseconds,
+          decidedAtUtc: existingOutcome.decided_at_utc,
+          youWon: existingOutcome.winner_player_id === playerId
+        });
+      }
+
+      const now = new Date().toISOString();
+      const writes = await env.DB.batch([
+        env.DB.prepare(
+          `INSERT OR IGNORE INTO match_results
+            (match_id, speedrun_user_id, player_id, level, category, subcategory,
+             igt_milliseconds, build_hash, confirmed_at_utc)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).bind(
+          match.id, session.speedrun_user_id, playerId, match.level, match.category,
+          match.subcategory, igtMilliseconds, buildHash, now
+        ),
+        env.DB.prepare(
+          `INSERT OR IGNORE INTO match_outcomes
+            (match_id, winner_player_id, winner_igt_milliseconds, decided_at_utc)
+           VALUES (?, ?, ?, ?)`
+        ).bind(match.id, playerId, igtMilliseconds, now)
+      ]);
+      const outcome = await env.DB.prepare(
+        `SELECT winner_player_id, winner_igt_milliseconds, decided_at_utc
+         FROM match_outcomes WHERE match_id = ?`
+      ).bind(match.id).first();
+
+      return json({
+        status: writes[0].meta.changes > 0 ? "submitted" : "already_submitted",
+        winnerPlayerId: outcome.winner_player_id,
+        winnerIgtMilliseconds: outcome.winner_igt_milliseconds,
+        decidedAtUtc: outcome.decided_at_utc,
+        youWon: outcome.winner_player_id === playerId
+      });
+    }
     if (request.method === "GET" && url.pathname.startsWith("/matches/")) {
       const playerId = decodeURIComponent(url.pathname.slice("/matches/".length));
       const result = await env.DB.prepare(`SELECT match_json FROM matches WHERE player_id = ?`).bind(playerId).first();
