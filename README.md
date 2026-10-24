@@ -1,4 +1,4 @@
-# TRASR — Tomb Raider Anniversary Speedrun Races
+# TRASR — Tomb Raider Anniversary Speedrunning
 
 Lightweight Tomb Raider: Anniversary race client.
 
