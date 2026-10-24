@@ -1,92 +1,84 @@
-# TRASR
+# TRASR — Tomb Raider Anniversary Speedrun Races
 
-TRASR is a prototype race client for **Tomb Raider: Anniversary**. It lets two players find a match, start a run together, track each other's status, and automatically submit a verified finish.
+Lightweight Tomb Raider: Anniversary race client.
 
-> This is an early Windows-only prototype. Use it with a legitimate installed copy of Tomb Raider: Anniversary.
+TRASR is a small Windows desktop app for racing Tomb Raider: Anniversary head-to-head. It handles Speedrun.com sign-in, matchmaking, opponent status, race forfeits, synchronized run starts, and automatic finish submission. Built with C++17, Qt 6, a Cloudflare Worker backend, and screen-based completion detection.
 
-## What it currently does
+## Start
 
-- Sign in with Speedrun.com.
-- Join a matchmaking queue for a chosen level and category.
-- Show your opponent's current race status.
-- Let either player forfeit an active match.
-- Detect the level-completion screen and submit the finish automatically.
-- Declare the first accepted finish as the winner and store the result on the server.
-- Coordinate a five-second ready countdown before attempting to navigate the game menus.
+Download the latest Windows release from [Releases](../../releases), extract it, and run `TRASR.exe`. Keep all files distributed alongside the executable together.
+
+1. Start TRASR and sign in with Speedrun.com.
+2. Select the level, category, and subcategory.
+3. Join either the random queue or selected-ruleset queue.
+4. Wait until a match is found.
+5. Open Tomb Raider: Anniversary and leave it on the main menu with **Play Game** highlighted.
+6. Both players press **Ready** in TRASR.
+7. During the five-second countdown, focus the game window.
+8. TRASR navigates to the selected level and starts both players together.
+9. Finish the level normally. TRASR detects the completion screen and submits the result.
+
+Use **Forfeit match** if you want to leave an active match. This immediately awards the match to your opponent.
+
+## Behavior
+
+- Uses Speedrun.com authentication for player identity.
+- Matches players by level, category, and subcategory.
+- Displays opponent state: waiting, ready, navigating menus, armed, running, restarted, finished, or forfeited.
+- Coordinates a shared race start after both players are ready.
+- Does not send menu input unless Tomb Raider: Anniversary is focused.
+- Watches for the game's completion screen before submitting a finish.
+- Awards the match to the first accepted valid finish.
+- Records match results and forfeits in the hosted backend.
+- Does not use time-trial completion as a requirement.
 
 ## Current limitations
 
-- Automatic menu navigation is currently implemented for **Final Conflict** only.
-- The player must have Tomb Raider: Anniversary focused with **Play Game** selected before both racers are ready.
-- Screen-based completion detection uses Tesseract OCR. Packaged releases will include its required runtime; source builds need it installed separately.
-- The project is still under active development and should not yet be considered a ranked-racing client.
+- Automatic menu navigation currently supports **Final Conflict** only.
+- Before both players press Ready, each player must manually leave the game on the main menu with **Play Game** selected.
+- Screen-based completion detection is still being tested across levels and display setups.
+- TRASR is currently a prototype and is not yet intended for ranked racing.
 
-## Playing a match
+## Build
 
-1. Start TRASR and sign in with Speedrun.com.
-2. Select the agreed level, category, and subcategory.
-3. Join a queue and wait until a match is found.
-4. Open Tomb Raider: Anniversary and leave it on the main menu with **Play Game** highlighted.
-5. Both players press **Ready** in TRASR.
-6. During the five-second countdown, focus the game window. TRASR will navigate to the selected level and start both players together.
-7. Finish normally. TRASR watches for the game’s completion screen and submits the result.
+Requirements: Windows, Qt 6 with Widgets and Network, CMake, a matching C++17 compiler, Python 3.13+, and Tesseract OCR.
 
-If you no longer want to continue, use **Forfeit match**. This immediately awards the match to your opponent.
+Install the detector's Python dependencies:
 
-## Installation
+    py -3.13 -m pip install -r tools\requirements-level-end-detector.txt
 
-When a release is available, download the Windows installer from the [Releases](../../releases) page, run it, and follow the installer prompts.
+For source builds, install Tesseract OCR and ensure it is available at:
 
-The installer is intended to include the client and screen-detection dependencies, so players should not need to install Python or Tesseract themselves.
+    C:\Program Files\Tesseract-OCR\tesseract.exe
 
-## Building from source
+Open `CMakeLists.txt` in Qt Creator, select an installed Qt Desktop kit, configure a Release build, and build the `TRASR` target.
 
-### Client
-
-Requirements:
-
-- Windows
-- Qt 6 with MinGW
-- CMake
-- Python 3.13 or later
-- Tesseract OCR
-
-Install the Python packages used by the completion detector:
-
-```powershell
-py -3.13 -m pip install -r tools\requirements-level-end-detector.txt
-```
-
-Open `CMakeLists.txt` in Qt Creator, configure a Release kit, and build the `TRASR` target.
-
-For source builds, make sure Tesseract is installed at:
-
-```text
-C:\Program Files\Tesseract-OCR\tesseract.exe
-```
+A future installer release will bundle the client and its detection dependencies so players will not need to set up Python or Tesseract manually.
 
 ## Backend deployment
 
-The `worker` folder contains the Cloudflare Worker and D1 database migrations used for matchmaking, player status, match outcomes, and forfeits.
+The `worker` directory contains the Cloudflare Worker and D1 database migrations.
 
-Before deploying an updated Worker, apply any new SQL files in `worker/migrations` to the production D1 database, in numeric order. Then deploy `worker/worker.js` through the Cloudflare dashboard or Wrangler.
+Apply new SQL files in `worker/migrations` to the production D1 database in numeric order before deploying the updated Worker. The backend stores matchmaking state, player presence, scheduled starts, match outcomes, and forfeits.
 
-## Project layout
+## Validation
 
-```text
-main.cpp                 Application entry point
-trasr_window.*           Client interface, matchmaking, and race controls
-run_monitor.*            Game monitoring and finish submission
-screen_completion.*      Reads completion events from the detector
-tra_process.*            Tomb Raider: Anniversary process/memory reader
-tools/                   Completion detector and menu automation scripts
-worker/                  Cloudflare Worker and D1 migrations
-```
+The completion detector requires the selected level's title and the level-completion screen to remain visible for multiple checks before it emits a completion event.
 
-## Contributing
+Race starts are cancelled safely if the game window is not focused, the menu navigation cannot finish, or the selected level does not load.
 
-Please open an issue or pull request with a clear description of the problem or change. In particular, reports for additional level-end detection routes are very useful.
+Live matchmaking, completion detection, and level-end routes are still actively being verified. Reports for additional level-end paths and unusual game states are especially useful.
+
+## Source layout
+
+- `main.cpp`: application entry point.
+- `trasr_window.*`: user interface, matchmaking, race controls, and opponent status.
+- `run_monitor.*`: game monitoring, integrity checks, and finish submission.
+- `screen_completion.*`: reads completion events from the screen detector.
+- `tra_process.*`: Tomb Raider: Anniversary process and memory reader.
+- `tools/`: completion detection and menu-navigation scripts.
+- `worker/`: Cloudflare Worker source and D1 migrations.
 
 ## Disclaimer
 
-TRASR is an unofficial fan-made project. It is not affiliated with Crystal Dynamics, Eidos, Square Enix, or Speedrun.com.
+TRASR is an unofficial fan-made project. It is not affiliated with Crystal Dynamics, Eidos, Square Enix, Tomb Raider, or Speedrun.com.
